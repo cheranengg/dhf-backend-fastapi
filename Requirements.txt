@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+pydantic>=2
+transformers>=4.41
+peft
+accelerate
+torch  # (or let your base image provide it)
+sentence-transformers
+langchain
+langchain-community
+faiss-cpu
+requests
+pandas
