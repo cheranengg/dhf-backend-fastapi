@@ -1,13 +1,23 @@
+# FastAPI & server
 fastapi
 uvicorn[standard]
-pydantic>=2
-transformers>=4.41
-peft
+pydantic<2
+
+# LLM stack
+transformers
 accelerate
-torch  # (or let your base image provide it)
+peft
 sentence-transformers
+faiss-cpu
+
+# Orchestration / validation (optional but used in your code)
 langchain
 langchain-community
-faiss-cpu
+guardrails-ai
+
+# Utilities
+numpy
 requests
-pandas
+
+# If your backend needs Drive access (usually not):
+# pydrive2
