@@ -4,7 +4,7 @@ from __future__ import annotations
 import os, re, json
 from typing import List, Dict, Any, Optional
 
-# --- add near top, after imports and defaults ---
+# ---------------- Fallback (stub) ----------------
 def _fallback_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     rows = []
     default_risks = [
@@ -34,13 +34,7 @@ def _fallback_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # ---- Toggle heavy model usage (safe default off for Cloud Run CPU) ----
 USE_HA_MODEL = os.getenv("USE_HA_MODEL", "0") == "1"
 
-# Only import torch/transformers/peft when we might need them.
-if USE_HA_MODEL:
-    import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-    from peft import PeftModel
-
-# Optional: local similarity for risk-control hinting
+# Optional similarity for risk-control hinting (safe if missing)
 try:
     from sentence_transformers import SentenceTransformer
     import faiss  # type: ignore
@@ -52,15 +46,21 @@ except Exception:
 HA_MODEL_MERGED_DIR = os.getenv("HA_MODEL_MERGED_DIR", "/models/mistral_finetuned_Hazard_Analysis_MERGED")
 BASE_MODEL_ID       = os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
 LORA_HA_DIR         = os.getenv("LORA_HA_DIR", "/models/mistral_finetuned_Hazard_Analysis")
-LOAD_WEB            = os.getenv("LOAD_WEB_SOURCES", "0") == "1"  # unused here, kept for future
 
+# ---------------- Lazy heavy imports / globals ----------------
 if USE_HA_MODEL:
-    DEVICE = "cuda" if getattr(__import__("torch"), "cuda").is_available() else "cpu"
-    DTYPE  = getattr(__import__("torch"), "float16") if DEVICE == "cuda" else getattr(__import__("torch"), "float32")
+    import torch  # type: ignore
+    from transformers import AutoTokenizer, AutoModelForCausalLM  # type: ignore
+    from peft import PeftModel  # type: ignore
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    DTYPE  = torch.float16 if DEVICE == "cuda" else torch.float32
+else:
+    AutoTokenizer = AutoModelForCausalLM = PeftModel = None  # type: ignore
+    torch = None  # type: ignore
+    DEVICE = DTYPE = None  # type: ignore
 
-# ---------------- Globals ----------------
-_tokenizer = None  # type: Optional["AutoTokenizer"]
-_model = None      # type: Optional["AutoModelForCausalLM"]
+_tokenizer: Optional["AutoTokenizer"] = None
+_model: Optional["AutoModelForCausalLM"] = None
 _emb: Optional["SentenceTransformer"] = None
 
 # ---------------- Guardrails helpers ----------------
@@ -105,19 +105,10 @@ def _extract_json(text: str) -> Dict[str, Any] | None:
 
 # ---------------- Loader ----------------
 def _load_model():
-    """
-    Load a merged fine-tuned model if present; otherwise load base + LoRA.
-    Skips entirely when USE_HA_MODEL=0.
-    """
+    """Load merged fine-tuned model, else base+LoRA. No-op when USE_HA_MODEL=0."""
     global _tokenizer, _model, _emb
-    if not USE_HA_MODEL:
+    if not USE_HA_MODEL or _model is not None:
         return
-    if _model is not None:
-        return
-
-    from transformers import AutoTokenizer, AutoModelForCausalLM  # local import
-    from peft import PeftModel                                   # local import
-    import torch
 
     if os.path.isdir(HA_MODEL_MERGED_DIR):
         _tokenizer = AutoTokenizer.from_pretrained(HA_MODEL_MERGED_DIR)
@@ -162,9 +153,8 @@ JSON fields:
 """
 
 def _gen_json_for_risk(risk: str) -> Dict[str, Any]:
-    # Only called in model mode
-    _load_model()
-    import torch
+    _load_model()  # ensures tokenizer/model exist
+    import torch  # local to avoid import when stub mode
     inputs = _tokenizer(_prompt_template.format(risk=risk), return_tensors="pt").to(DEVICE)  # type: ignore
     with torch.no_grad():
         out = _model.generate(  # type: ignore
@@ -196,48 +186,21 @@ def _nearest_req_control(reqs: List[Dict[str, Any]], hint_text: str) -> str:
         return "Refer to IEC 60601 and ISO 14971 risk controls"
 
 def ha_predict(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # Fast stub path for Cloud Run CPU
     if not USE_HA_MODEL:
         return _fallback_ha(requirements)
-    _load_model()
-    """
-    Generate HA rows tied to each requirement.
-    """
-    # ---- Stub mode: no heavy model load ----
-    if not USE_HA_MODEL:
-        out: List[Dict[str, Any]] = []
-        # Keep it small & deterministic for smoke tests
-        stub_risks = ["Overdose", "Underdose", "Occlusion", "Air Embolism", "Infection"]
-        for r in requirements:
-            rid = r.get("Requirement ID") or ""
-            rtext = r.get("Requirements") or ""
-            for i, risk in enumerate(stub_risks, start=1):
-                hint = risk
-                control = _nearest_req_control(requirements, hint)
-                out.append({
-                    "requirement_id": rid,
-                    "risk_id": f"HA-{i:04}",
-                    "risk_to_health": risk,
-                    "hazard": "Not available",
-                    "hazardous_situation": "Not available",
-                    "harm": "Not available",
-                    "sequence_of_events": "Not available",
-                    "severity_of_harm": 3,
-                    "p0": "Medium",
-                    "p1": "Medium",
-                    "poh": "Medium",
-                    "risk_index": "Medium",
-                    "risk_control": control or "Refer to IEC 60601 and ISO 14971 risk controls",
-                })
-        return out
 
-    # ---- Real model path ----
+    # Real model path
     _load_model()
     out: List[Dict[str, Any]] = []
     for r in requirements:
         rid   = r.get("Requirement ID") or ""
         rtext = r.get("Requirements") or ""
         for risk in _default_risks:
-            parsed = _gen_json_for_risk(risk)
+            try:
+                parsed = _gen_json_for_risk(risk)
+            except Exception:
+                parsed = {}
             severity, p0, p1, poh, risk_index = _calculate_risk_fields(parsed)
             hint = (parsed.get("Hazardous Situation", "") + " " + parsed.get("Harm", "")).strip() or rtext
             control = _nearest_req_control(requirements, hint)
