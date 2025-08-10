@@ -1,21 +1,19 @@
-# ======================
 # app/models/tm_infer.py
-# ======================
+from __future__ import annotations
+
 import os, json, re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# Defaulted to your path; override with TM_MODEL_DIR env var in prod
-TM_MODEL_DIR = os.getenv(
-    "TM_MODEL_DIR",
-    "/content/drive/MyDrive/Colab Notebooks/Dissertation/mistral_finetuned_Trace_Matrix",
-)
+# Prefer a merged finetuned folder baked into the image
+TM_MODEL_DIR = os.getenv("TM_MODEL_DIR", "/models/mistral_finetuned_Trace_Matrix")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DTYPE  = torch.float16 if DEVICE == "cuda" else torch.float32
 
-_tokenizer = None
-_model = None
+_tokenizer: Optional[AutoTokenizer] = None
+_model: Optional[AutoModelForCausalLM] = None
 
 _json_obj = re.compile(r"\{[\s\S]*?\}")
 
@@ -26,11 +24,8 @@ def _load_tm_model():
     _tokenizer = AutoTokenizer.from_pretrained(TM_MODEL_DIR)
     if _tokenizer.pad_token is None:
         _tokenizer.pad_token = _tokenizer.eos_token
-    _model = AutoModelForCausalLM.from_pretrained(
-        TM_MODEL_DIR,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto",
-    )
+    _model = AutoModelForCausalLM.from_pretrained(TM_MODEL_DIR, torch_dtype=DTYPE)
+    _model.to(DEVICE)
 
 def _extract_json(text: str) -> Dict[str, Any] | None:
     if not text:
@@ -48,30 +43,29 @@ def _extract_json(text: str) -> Dict[str, Any] | None:
     except Exception:
         return None
 
-def _is_heading(requirement_text: str, verification_id: str) -> bool:
-    if not verification_id:
-        return True
+def _is_heading(requirement_text: str) -> bool:
+    """Treat obvious section headers as headings; don't rely on empty VID."""
     t = (requirement_text or "").strip().lower()
-    return t in {
-        "functional requirements", "performance requirements", "safety requirements",
-        "usability requirements", "environmental requirements", "design inputs",
-        "general requirements"
-    }
+    return (
+        not t
+        or t.endswith(" requirements")
+        or t in {
+            "functional requirements", "performance requirements", "safety requirements",
+            "usability requirements", "environmental requirements", "design inputs",
+            "general requirements"
+        }
+    )
 
 def _join_unique(values: List[str]) -> str:
     vals = [str(v).strip() for v in values if str(v).strip() and str(v).strip().upper() != "NA"]
-    seen = []
+    seen: List[str] = []
     for v in vals:
         if v not in seen:
             seen.append(v)
     return ", ".join(seen) if seen else "NA"
 
 def tm_predict(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]], dvp: List[Dict[str, Any]]):
-    """Use the fine-tuned Trace Matrix model to produce final rows.
-    The model is expected to emit JSON directly. We pass a compact context per
-    requirement (Requirement + HA slice + DVP slice), parse JSON, and fall back
-    to a rules-based composition with 'TBD - Human / SME input' if needed.
-    """
+    """Generate Trace Matrix rows. Model should emit JSON; otherwise fall back."""
     _load_tm_model()
     rows: List[Dict[str, Any]] = []
 
@@ -79,9 +73,10 @@ def tm_predict(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]], dvp
     from collections import defaultdict
     ha_by_req: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for h in ha or []:
-        rid = str(h.get("requirement_id")) or str(h.get("Requirement ID", ""))
+        rid = str(h.get("requirement_id") or h.get("Requirement ID") or "")
         if rid:
             ha_by_req[rid].append(h)
+
     dvp_by_vid: Dict[str, Dict[str, Any]] = {}
     for d in dvp or []:
         vid = str(d.get("verification_id") or d.get("Verification ID") or "")
@@ -94,7 +89,7 @@ def tm_predict(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]], dvp
         rtxt = r.get("Requirements", "") or ""
 
         # Headings -> NA
-        if _is_heading(rtxt, vid):
+        if _is_heading(rtxt):
             rows.append({
                 "verification_id": vid or "NA",
                 "requirement_id": rid,
@@ -118,14 +113,14 @@ def tm_predict(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]], dvp
         method = drow.get("verification_method") or drow.get("Verification Method") or "TBD - Human / SME input"
         criteria = drow.get("acceptance_criteria") or drow.get("Acceptance Criteria") or "TBD - Human / SME input"
 
-        # Prompt the TM model (it should output JSON directly)
+        # Prompt model (expects JSON)
         instruction = (
             "You are generating a Traceability Matrix row for an infusion pump.\n"
-            "Return ONLY a single JSON object with keys:\n"
+            "Return ONLY a single JSON object with keys: "
             "{\"verification_id\",\"requirement_id\",\"requirements\","
             "\"risk_ids\",\"risks_to_health\",\"ha_risk_controls\","
             "\"verification_method\",\"acceptance_criteria\"}.\n"
-            "Use comma-separated strings for fields that may contain multiple values."
+            "Use comma-separated strings for list-like fields."
         )
         context = {
             "requirement": {"Requirement ID": rid, "Verification ID": vid, "Requirements": rtxt},
@@ -134,23 +129,24 @@ def tm_predict(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]], dvp
         }
         prompt = instruction + "\nINPUT:\n" + json.dumps(context, ensure_ascii=False)
 
+        parsed = None
         try:
-            inputs = _tokenizer(prompt, return_tensors="pt").to(DEVICE)
+            inputs = _tokenizer(prompt, return_tensors="pt").to(DEVICE)  # type: ignore
             with torch.no_grad():
-                outputs = _model.generate(
+                outputs = _model.generate(  # type: ignore
                     **inputs,
                     max_new_tokens=400,
                     temperature=0.2,
                     do_sample=True,
                     top_p=0.9,
                 )
-            decoded = _tokenizer.decode(outputs[0], skip_special_tokens=True)
+            decoded = _tokenizer.decode(outputs[0], skip_special_tokens=True)  # type: ignore
             parsed = _extract_json(decoded)
         except Exception:
             parsed = None
 
         if not parsed:
-            # Fallback
+            # Fallback composition
             parsed = {
                 "verification_id": vid,
                 "requirement_id": rid,
@@ -162,7 +158,7 @@ def tm_predict(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]], dvp
                 "acceptance_criteria": criteria,
             }
         else:
-            # Fill any gaps and normalize
+            # Normalize & fill gaps
             parsed.setdefault("verification_id", vid)
             parsed.setdefault("requirement_id", rid)
             parsed.setdefault("requirements", rtxt)
@@ -172,7 +168,7 @@ def tm_predict(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]], dvp
             parsed.setdefault("verification_method", method)
             parsed.setdefault("acceptance_criteria", criteria)
 
-            for k in ["risk_ids","risks_to_health","ha_risk_controls","verification_method","acceptance_criteria"]:
+            for k in ("risk_ids", "risks_to_health", "ha_risk_controls", "verification_method", "acceptance_criteria"):
                 if not str(parsed.get(k, "")).strip():
                     parsed[k] = "TBD - Human / SME input"
 
