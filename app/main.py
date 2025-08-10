@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import logging
 from typing import Any, Dict, List
 
 from fastapi import FastAPI, Depends, HTTPException, Request, status
@@ -31,7 +32,7 @@ from app.utils.guardrails import (
     guard_tm_rows,
 )
 
-# Model wrappers (implement these modules per your training/inference code)
+# Model wrappers
 from app.models import ha_infer, dvp_infer, tm_infer
 
 
@@ -50,7 +51,6 @@ def require_auth(request: Request):
 # ---------------- App ----------------
 app = FastAPI(title="DHF Backend (HA/DVP/TM)", version="1.0.0")
 
-# In production, set a specific list of allowed origins (e.g., your Streamlit domain)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],       # tighten in prod
@@ -62,19 +62,17 @@ app.add_middleware(
 
 # ---------------- Helpers ----------------
 def _reqs_to_dicts(reqs: List[RequirementInput]) -> List[Dict[str, Any]]:
-    """Convert RequirementInput to dicts with canonical keys used across wrappers."""
     out: List[Dict[str, Any]] = []
     for r in reqs:
         out.append({
             "Requirement ID": sanitize_text(r.requirement_id or ""),
-            "Verification ID": "",  # may be empty; DVP/TM logic can assign/consume
+            "Verification ID": "",
             "Requirements": sanitize_text(r.requirements),
         })
     return out
 
 
 def _normalize_ha_row(r: Dict[str, Any]) -> Dict[str, Any]:
-    """Ensure all HA fields exist and are strings; fill missing with TBD where appropriate."""
     return {
         "requirement_id": sanitize_text(r.get("requirement_id") or r.get("Requirement ID") or ""),
         "risk_id": ensure_tbd(r.get("risk_id") or r.get("Risk ID")),
@@ -105,7 +103,6 @@ def _normalize_dvp_row(r: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _normalize_tm_row_api(r: Dict[str, Any]) -> Dict[str, Any]:
-    # Start with guardrails' normalized row
     base = normalize_tm_row({
         "verification_id": r.get("verification_id") or r.get("Verification ID"),
         "requirement_id": r.get("requirement_id") or r.get("Requirement ID"),
@@ -116,7 +113,6 @@ def _normalize_tm_row_api(r: Dict[str, Any]) -> Dict[str, Any]:
         "verification_method": r.get("verification_method") or r.get("Verification Method"),
         "acceptance_criteria": r.get("acceptance_criteria") or r.get("Acceptance Criteria"),
     })
-    # Minor compatibility cleanups
     base["risk_ids"] = base["risk_ids"].replace(" ,", ",").replace(", ,", ",").strip()
     base["ha_risk_controls"] = base["ha_risk_controls"].replace(" ,", ",").replace(", ,", ",").strip()
     return base
@@ -127,28 +123,39 @@ def _normalize_tm_row_api(r: Dict[str, Any]) -> Dict[str, Any]:
 def health():
     return {"ok": True}
 
+@app.get("/debug/flags")
+def debug_flags(_=Depends(require_auth)):
+    """Check environment variables are loaded."""
+    return {
+        "USE_HA_MODEL": os.getenv("USE_HA_MODEL"),
+        "USE_DVP_MODEL": os.getenv("USE_DVP_MODEL"),
+        "USE_TM_MODEL": os.getenv("USE_TM_MODEL"),
+        "HA_MODEL_MERGED_DIR": os.getenv("HA_MODEL_MERGED_DIR"),
+        "BASE_MODEL_ID": os.getenv("BASE_MODEL_ID"),
+        "LORA_HA_DIR": os.getenv("LORA_HA_DIR"),
+    }
 
 @app.post("/hazard-analysis", response_model=HazardAnalysisOutput)
 def hazard_analysis(payload: Dict[str, Any], _=Depends(require_auth)):
-    raw_reqs = payload.get("requirements", [])
-    if not isinstance(raw_reqs, list) or not raw_reqs:
-        raise HTTPException(400, "`requirements` must be a non-empty list")
+    try:
+        raw_reqs = payload.get("requirements", [])
+        if not isinstance(raw_reqs, list) or not raw_reqs:
+            raise HTTPException(400, "`requirements` must be a non-empty list")
 
-    # Accept either canonical dicts or RequirementInput-like dicts
-    if "Requirements" in (raw_reqs[0] or {}):
-        reqs_dict = raw_reqs  # already canonical from Streamlit app
-    else:
-        reqs_dict = _reqs_to_dicts([RequirementInput(**r) for r in raw_reqs])
+        if "Requirements" in (raw_reqs[0] or {}):
+            reqs_dict = raw_reqs
+        else:
+            reqs_dict = _reqs_to_dicts([RequirementInput(**r) for r in raw_reqs])
 
-    # Call your HA model wrapper
-    ha_rows_raw: List[Dict[str, Any]] = ha_infer.ha_predict(reqs_dict)
+        ha_rows_raw: List[Dict[str, Any]] = ha_infer.ha_predict(reqs_dict)
 
-    # Normalize & map to schema
-    ha_rows_norm = [_normalize_ha_row(r) for r in ha_rows_raw]
-    return {
-        "ha": [HazardAnalysisRow(**row) for row in ha_rows_norm]  # type: ignore
-    }
-
+        ha_rows_norm = [_normalize_ha_row(r) for r in ha_rows_raw]
+        return {"ha": [HazardAnalysisRow(**row) for row in ha_rows_norm]}  # type: ignore
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception("HA route crashed")
+        raise HTTPException(status_code=500, detail=f"HA error: {type(e).__name__}: {e}")
 
 @app.post("/dvp", response_model=DvpOutput)
 def dvp(payload: Dict[str, Any], _=Depends(require_auth)):
@@ -162,10 +169,8 @@ def dvp(payload: Dict[str, Any], _=Depends(require_auth)):
     else:
         reqs_dict = _reqs_to_dicts([RequirementInput(**r) for r in raw_reqs])
 
-    # Call your DVP model wrapper
     dvp_rows_raw: List[Dict[str, Any]] = dvp_infer.dvp_predict(reqs_dict, ha_rows)
 
-    # Normalize & map
     dvp_rows_norm = [_normalize_dvp_row(r) for r in dvp_rows_raw]
     return {
         "dvp": [DvpRow(
@@ -177,7 +182,6 @@ def dvp(payload: Dict[str, Any], _=Depends(require_auth)):
             acceptance_criteria=row["acceptance_criteria"],
         ) for row in dvp_rows_norm]
     }
-
 
 @app.post("/trace-matrix", response_model=TraceMatrixOutput)
 def trace_matrix(payload: Dict[str, Any], _=Depends(require_auth)):
@@ -193,20 +197,14 @@ def trace_matrix(payload: Dict[str, Any], _=Depends(require_auth)):
     else:
         reqs_dict = _reqs_to_dicts([RequirementInput(**r) for r in raw_reqs])
 
-    # Call your TM model wrapper (expects JSON output from the model; falls back to deterministic)
     tm_rows_raw: List[Dict[str, Any]] = tm_infer.tm_predict(reqs_dict, ha_rows, dvp_rows)
 
-    # Normalize rows for API response and guardrail check
     tm_rows_norm = [_normalize_tm_row_api(r) for r in tm_rows_raw]
 
-    # Guardrails: validate and (optionally) log issues
     result = guard_tm_rows(tm_rows_norm, allowed_methods=DEFAULT_ALLOWED_METHODS)
     if not result.ok:
-        # You can log issues to stdout or a logger here:
-        # for issue in result.issues: print(vars(issue))
         pass
 
-    # Map to schema
     return {
         "trace_matrix": [TraceMatrixRow(**row) for row in tm_rows_norm]  # type: ignore
     }
