@@ -1,14 +1,17 @@
 # app/models/ha_infer.py
 from __future__ import annotations
 
-import os
-import re
-import json
+import os, re, json
 from typing import List, Dict, Any, Optional
 
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import PeftModel
+# ---- Toggle heavy model usage (safe default off for Cloud Run CPU) ----
+USE_HA_MODEL = os.getenv("USE_HA_MODEL", "0") == "1"
+
+# Only import torch/transformers/peft when we might need them.
+if USE_HA_MODEL:
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from peft import PeftModel
 
 # Optional: local similarity for risk-control hinting
 try:
@@ -19,22 +22,19 @@ except Exception:
     _HAS_EMB = False
 
 # ---------------- Config ----------------
-# Prefer a MERGED checkpoint directory to avoid loading base + LoRA at runtime.
-# If MERGED is missing, we’ll fall back to base + LoRA (requires both on disk).
 HA_MODEL_MERGED_DIR = os.getenv("HA_MODEL_MERGED_DIR", "/models/mistral_finetuned_Hazard_Analysis_MERGED")
 BASE_MODEL_ID       = os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
 LORA_HA_DIR         = os.getenv("LORA_HA_DIR", "/models/mistral_finetuned_Hazard_Analysis")
+LOAD_WEB            = os.getenv("LOAD_WEB_SOURCES", "0") == "1"  # unused here, kept for future
 
-# Disable any web fetch by default for Cloud Run (no egress by default)
-LOAD_WEB = os.getenv("LOAD_WEB_SOURCES", "0") == "1"
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE  = torch.float16 if DEVICE == "cuda" else torch.float32
+if USE_HA_MODEL:
+    DEVICE = "cuda" if getattr(__import__("torch"), "cuda").is_available() else "cpu"
+    DTYPE  = getattr(__import__("torch"), "float16") if DEVICE == "cuda" else getattr(__import__("torch"), "float32")
 
 # ---------------- Globals ----------------
-_tokenizer: Optional[AutoTokenizer] = None
-_model: Optional[AutoModelForCausalLM] = None
-_emb: Optional[SentenceTransformer] = None
+_tokenizer = None  # type: Optional["AutoTokenizer"]
+_model = None      # type: Optional["AutoModelForCausalLM"]
+_emb: Optional["SentenceTransformer"] = None
 
 # ---------------- Guardrails helpers ----------------
 _severity_map = {"negligible": 1, "minor": 2, "moderate": 3, "serious": 4, "critical": 5}
@@ -42,10 +42,8 @@ _severity_map = {"negligible": 1, "minor": 2, "moderate": 3, "serious": 4, "crit
 def _calculate_risk_fields(parsed: Dict[str, Any]):
     sev_txt = str(parsed.get("Severity of Harm", "Moderate")).lower()
     severity = _severity_map.get(sev_txt, 3)
-
     p0 = parsed.get("P0", "Medium")
     p1 = parsed.get("P1", "Medium")
-
     poh_matrix = {
         ("Very Low","Very Low"):"Very Low", ("Very Low","Low"):"Very Low",
         ("Very Low","Medium"):"Low", ("Low","Very Low"):"Very Low",
@@ -54,7 +52,6 @@ def _calculate_risk_fields(parsed: Dict[str, Any]):
         ("Very High","High"):"Very High", ("Very High","Very High"):"Very High",
     }
     poh = poh_matrix.get((p0, p1), "Medium")
-
     if severity == 5 and poh in ("High", "Very High"):
         risk_index = "Extreme"
     elif severity >= 3 and poh in ("High", "Very High"):
@@ -83,20 +80,24 @@ def _extract_json(text: str) -> Dict[str, Any] | None:
 def _load_model():
     """
     Load a merged fine-tuned model if present; otherwise load base + LoRA.
-    Always place the final model on DEVICE and use explicit dtype (no device_map=auto).
+    Skips entirely when USE_HA_MODEL=0.
     """
     global _tokenizer, _model, _emb
+    if not USE_HA_MODEL:
+        return
     if _model is not None:
         return
 
+    from transformers import AutoTokenizer, AutoModelForCausalLM  # local import
+    from peft import PeftModel                                   # local import
+    import torch
+
     if os.path.isdir(HA_MODEL_MERGED_DIR):
-        # Best for Cloud Run: a single merged folder (no PEFT assembly at runtime)
         _tokenizer = AutoTokenizer.from_pretrained(HA_MODEL_MERGED_DIR)
         if _tokenizer.pad_token is None:
             _tokenizer.pad_token = _tokenizer.eos_token
         _model = AutoModelForCausalLM.from_pretrained(HA_MODEL_MERGED_DIR, torch_dtype=DTYPE)
     else:
-        # Fallback: base + LoRA (both must be available on disk in the image)
         _tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID)
         if _tokenizer.pad_token is None:
             _tokenizer.pad_token = _tokenizer.eos_token
@@ -105,7 +106,6 @@ def _load_model():
 
     _model.to(DEVICE)
 
-    # Optional local embedder for nearest-neighbor control suggestion
     if _HAS_EMB:
         try:
             _emb = SentenceTransformer("all-MiniLM-L6-v2")
@@ -123,7 +123,7 @@ _prompt_template = """Return ONLY valid JSON for the following risk in an infusi
 Risk: {risk}
 
 JSON fields:
-{{
+{
   "Hazard": "...",
   "Hazardous Situation": "...",
   "Harm": "...",
@@ -131,13 +131,14 @@ JSON fields:
   "Severity of Harm": "Negligible|Minor|Moderate|Serious|Critical",
   "P0": "Very Low|Low|Medium|High|Very High",
   "P1": "Very Low|Low|Medium|High|Very High"
-}}
+}
 """
 
 def _gen_json_for_risk(risk: str) -> Dict[str, Any]:
+    # Only called in model mode
     _load_model()
-    prompt = _prompt_template.format(risk=risk)
-    inputs = _tokenizer(prompt, return_tensors="pt").to(DEVICE)  # type: ignore
+    import torch
+    inputs = _tokenizer(_prompt_template.format(risk=risk), return_tensors="pt").to(DEVICE)  # type: ignore
     with torch.no_grad():
         out = _model.generate(  # type: ignore
             **inputs,
@@ -147,27 +148,19 @@ def _gen_json_for_risk(risk: str) -> Dict[str, Any]:
             top_p=0.9,
         )
     decoded = _tokenizer.decode(out[0], skip_special_tokens=True)  # type: ignore
-    parsed = _extract_json(decoded) or {}
-    return parsed
+    return _extract_json(decoded) or {}
 
 def _nearest_req_control(reqs: List[Dict[str, Any]], hint_text: str) -> str:
-    """
-    Returns a simple 'risk_control' string by picking the nearest requirement text
-    to the hint_text. Works locally with sentence-transformers + FAISS, no web calls.
-    """
     if not _HAS_EMB:
         return "Refer to IEC 60601 and ISO 14971 risk controls"
-
     try:
         corpus = [str(r.get("Requirements") or "") for r in reqs]
         ids    = [str(r.get("Requirement ID") or "") for r in reqs]
         if not corpus:
             return "Refer to IEC 60601 and ISO 14971 risk controls"
-
         vecs = _emb.encode(corpus, convert_to_numpy=True)  # type: ignore
         index = faiss.IndexFlatL2(vecs.shape[1])
         index.add(vecs)
-
         q = _emb.encode([hint_text or "risk control"], convert_to_numpy=True)  # type: ignore
         D, I = index.search(q, 1)
         i = int(I[0][0])
@@ -178,26 +171,46 @@ def _nearest_req_control(reqs: List[Dict[str, Any]], hint_text: str) -> str:
 def ha_predict(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Generate HA rows tied to each requirement.
-
-    Input requirements are canonical dicts with keys:
-      - "Requirement ID", "Requirements", (optional) "Verification ID"
     """
+    # ---- Stub mode: no heavy model load ----
+    if not USE_HA_MODEL:
+        out: List[Dict[str, Any]] = []
+        # Keep it small & deterministic for smoke tests
+        stub_risks = ["Overdose", "Underdose", "Occlusion", "Air Embolism", "Infection"]
+        for r in requirements:
+            rid = r.get("Requirement ID") or ""
+            rtext = r.get("Requirements") or ""
+            for i, risk in enumerate(stub_risks, start=1):
+                hint = risk
+                control = _nearest_req_control(requirements, hint)
+                out.append({
+                    "requirement_id": rid,
+                    "risk_id": f"HA-{i:04}",
+                    "risk_to_health": risk,
+                    "hazard": "Not available",
+                    "hazardous_situation": "Not available",
+                    "harm": "Not available",
+                    "sequence_of_events": "Not available",
+                    "severity_of_harm": 3,
+                    "p0": "Medium",
+                    "p1": "Medium",
+                    "poh": "Medium",
+                    "risk_index": "Medium",
+                    "risk_control": control or "Refer to IEC 60601 and ISO 14971 risk controls",
+                })
+        return out
+
+    # ---- Real model path ----
     _load_model()
     out: List[Dict[str, Any]] = []
-
     for r in requirements:
         rid   = r.get("Requirement ID") or ""
         rtext = r.get("Requirements") or ""
         for risk in _default_risks:
             parsed = _gen_json_for_risk(risk)
-
-            # Guardrail enrichments
             severity, p0, p1, poh, risk_index = _calculate_risk_fields(parsed)
-
-            # Simple risk-control via nearest requirement text
             hint = (parsed.get("Hazardous Situation", "") + " " + parsed.get("Harm", "")).strip() or rtext
             control = _nearest_req_control(requirements, hint)
-
             out.append({
                 "requirement_id": rid,
                 "risk_id": f"HA-{abs(hash(risk + rid)) % 10_000:04}",
