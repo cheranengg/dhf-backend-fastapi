@@ -1,44 +1,22 @@
 # app/main.py
-# FastAPI backend for DHF Automation (HA → DVP → TM)
 from __future__ import annotations
-
-import os
-import logging
+import os, traceback
 from typing import Any, Dict, List
-
 from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 
-# Schemas
 from app.utils.io_schemas import (
-    RequirementInput,
-    BatchRequirementsInput,
-    HazardAnalysisRow,
-    HazardAnalysisOutput,
-    DvpRow,
-    DvpOutput,
-    TraceMatrixRow,
-    TraceMatrixOutput,
+    RequirementInput, HazardAnalysisRow, HazardAnalysisOutput,
+    DvpRow, DvpOutput, TraceMatrixRow, TraceMatrixOutput
 )
-
-# Guardrails
 from app.utils.guardrails import (
-    TBD,
-    DEFAULT_ALLOWED_METHODS,
-    sanitize_text,
-    ensure_tbd,
-    join_unique,
-    normalize_tm_row,
-    guard_tm_rows,
+    DEFAULT_ALLOWED_METHODS, sanitize_text, ensure_tbd,
+    normalize_tm_row, guard_tm_rows
 )
-
-# Model wrappers
 from app.models import ha_infer, dvp_infer, tm_infer
 
-
-# ---------------- Security ----------------
+# -------- Security --------
 BACKEND_TOKEN = os.getenv("BACKEND_TOKEN", "dev-token")
-
 def require_auth(request: Request):
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
@@ -47,20 +25,15 @@ def require_auth(request: Request):
     if token != BACKEND_TOKEN:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid token")
 
-
-# ---------------- App ----------------
+# -------- App --------
 app = FastAPI(title="DHF Backend (HA/DVP/TM)", version="1.0.0")
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # tighten in prod
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
-
-# ---------------- Helpers ----------------
+# -------- Helpers --------
 def _reqs_to_dicts(reqs: List[RequirementInput]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for r in reqs:
@@ -70,7 +43,6 @@ def _reqs_to_dicts(reqs: List[RequirementInput]) -> List[Dict[str, Any]]:
             "Requirements": sanitize_text(r.requirements),
         })
     return out
-
 
 def _normalize_ha_row(r: Dict[str, Any]) -> Dict[str, Any]:
     return {
@@ -89,7 +61,6 @@ def _normalize_ha_row(r: Dict[str, Any]) -> Dict[str, Any]:
         "risk_control": ensure_tbd(r.get("risk_control") or r.get("Risk Control") or r.get("HA Risk Control")),
     }
 
-
 def _normalize_dvp_row(r: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "verification_id": sanitize_text(r.get("verification_id") or r.get("Verification ID") or ""),
@@ -100,7 +71,6 @@ def _normalize_dvp_row(r: Dict[str, Any]) -> Dict[str, Any]:
         "acceptance_criteria": ensure_tbd(r.get("acceptance_criteria") or r.get("Acceptance Criteria")),
         "test_procedure": ensure_tbd(r.get("test_procedure") or r.get("Test Procedure")),
     }
-
 
 def _normalize_tm_row_api(r: Dict[str, Any]) -> Dict[str, Any]:
     base = normalize_tm_row({
@@ -117,94 +87,91 @@ def _normalize_tm_row_api(r: Dict[str, Any]) -> Dict[str, Any]:
     base["ha_risk_controls"] = base["ha_risk_controls"].replace(" ,", ",").replace(", ,", ",").strip()
     return base
 
-
-# ---------------- Routes ----------------
+# -------- Routes --------
 @app.get("/health")
 def health():
     return {"ok": True}
 
-@app.get("/debug/flags")
-def debug_flags(_=Depends(require_auth)):
-    """Check environment variables are loaded."""
+@app.get("/debug/flags", dependencies=[Depends(require_auth)])
+def debug_flags():
     return {
-        "USE_HA_MODEL": os.getenv("USE_HA_MODEL"),
-        "USE_DVP_MODEL": os.getenv("USE_DVP_MODEL"),
-        "USE_TM_MODEL": os.getenv("USE_TM_MODEL"),
-        "HA_MODEL_MERGED_DIR": os.getenv("HA_MODEL_MERGED_DIR"),
-        "BASE_MODEL_ID": os.getenv("BASE_MODEL_ID"),
-        "LORA_HA_DIR": os.getenv("LORA_HA_DIR"),
+        "USE_HA_MODEL": os.getenv("USE_HA_MODEL", "0"),
+        "DVP_MODEL_DIR": os.getenv("DVP_MODEL_DIR", ""),
+        "TM_MODEL_DIR": os.getenv("TM_MODEL_DIR", ""),
+        "HA_MODEL_MERGED_DIR": os.getenv("HA_MODEL_MERGED_DIR", ""),
+        "LORA_HA_DIR": os.getenv("LORA_HA_DIR", ""),
+        "BASE_MODEL_ID": os.getenv("BASE_MODEL_ID", ""),
     }
 
-@app.post("/hazard-analysis", response_model=HazardAnalysisOutput)
-def hazard_analysis(payload: Dict[str, Any], _=Depends(require_auth)):
+@app.post("/debug/smoke", dependencies=[Depends(require_auth)])
+def debug_smoke():
+    try:
+        reqs = [
+            {"Requirement ID": "REQ-001", "Verification ID": "VER-001", "Requirements": "Detect air-in-line within 1 second"},
+            {"Requirement ID": "REQ-002", "Verification ID": "VER-002", "Requirements": "Stop infusion on occlusion"},
+        ]
+        ha_rows = ha_infer.ha_predict(reqs)
+        dvp_rows = dvp_infer.dvp_predict(reqs, ha_rows)
+        tm_rows  = tm_infer.tm_predict(reqs, ha_rows, dvp_rows)
+        return {"ok": True, "sizes": {"ha": len(ha_rows), "dvp": len(dvp_rows), "tm": len(tm_rows)}}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "trace": traceback.format_exc()}
+
+@app.post("/hazard-analysis", response_model=HazardAnalysisOutput, dependencies=[Depends(require_auth)])
+def hazard_analysis(payload: Dict[str, Any]):
     try:
         raw_reqs = payload.get("requirements", [])
         if not isinstance(raw_reqs, list) or not raw_reqs:
             raise HTTPException(400, "`requirements` must be a non-empty list")
-
-        if "Requirements" in (raw_reqs[0] or {}):
-            reqs_dict = raw_reqs
-        else:
-            reqs_dict = _reqs_to_dicts([RequirementInput(**r) for r in raw_reqs])
-
+        reqs_dict = raw_reqs if "Requirements" in (raw_reqs[0] or {}) else _reqs_to_dicts(raw_reqs)
         ha_rows_raw: List[Dict[str, Any]] = ha_infer.ha_predict(reqs_dict)
-
         ha_rows_norm = [_normalize_ha_row(r) for r in ha_rows_raw]
         return {"ha": [HazardAnalysisRow(**row) for row in ha_rows_norm]}  # type: ignore
     except HTTPException:
         raise
     except Exception as e:
-        logging.exception("HA route crashed")
-        raise HTTPException(status_code=500, detail=f"HA error: {type(e).__name__}: {e}")
+        raise HTTPException(500, f"HA failed: {e}")
 
-@app.post("/dvp", response_model=DvpOutput)
-def dvp(payload: Dict[str, Any], _=Depends(require_auth)):
-    raw_reqs = payload.get("requirements", [])
-    ha_rows = payload.get("ha", [])
-    if not isinstance(raw_reqs, list) or not raw_reqs:
-        raise HTTPException(400, "`requirements` must be a non-empty list")
+@app.post("/dvp", response_model=DvpOutput, dependencies=[Depends(require_auth)])
+def dvp(payload: Dict[str, Any]):
+    try:
+        raw_reqs = payload.get("requirements", [])
+        ha_rows = payload.get("ha", [])
+        if not isinstance(raw_reqs, list) or not raw_reqs:
+            raise HTTPException(400, "`requirements` must be a non-empty list")
+        reqs_dict = raw_reqs if "Requirements" in (raw_reqs[0] or {}) else _reqs_to_dicts(raw_reqs)
+        dvp_rows_raw: List[Dict[str, Any]] = dvp_infer.dvp_predict(reqs_dict, ha_rows)
+        dvp_rows_norm = [_normalize_dvp_row(r) for r in dvp_rows_raw]
+        return {
+            "dvp": [DvpRow(
+                verification_id=row["verification_id"],
+                requirement_id=row.get("requirement_id"),
+                requirements=row.get("requirements"),
+                verification_method=row["verification_method"],
+                sample_size=int(row["sample_size"]) if row.get("sample_size", "").isdigit() else None,
+                acceptance_criteria=row["acceptance_criteria"],
+            ) for row in dvp_rows_norm]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"DVP failed: {e}")
 
-    if "Requirements" in (raw_reqs[0] or {}):
-        reqs_dict = raw_reqs
-    else:
-        reqs_dict = _reqs_to_dicts([RequirementInput(**r) for r in raw_reqs])
-
-    dvp_rows_raw: List[Dict[str, Any]] = dvp_infer.dvp_predict(reqs_dict, ha_rows)
-
-    dvp_rows_norm = [_normalize_dvp_row(r) for r in dvp_rows_raw]
-    return {
-        "dvp": [DvpRow(
-            verification_id=row["verification_id"],
-            requirement_id=row.get("requirement_id"),
-            requirements=row.get("requirements"),
-            verification_method=row["verification_method"],
-            sample_size=int(row["sample_size"]) if row.get("sample_size", "").isdigit() else None,
-            acceptance_criteria=row["acceptance_criteria"],
-        ) for row in dvp_rows_norm]
-    }
-
-@app.post("/trace-matrix", response_model=TraceMatrixOutput)
-def trace_matrix(payload: Dict[str, Any], _=Depends(require_auth)):
-    raw_reqs = payload.get("requirements", [])
-    ha_rows = payload.get("ha", [])
-    dvp_rows = payload.get("dvp", [])
-
-    if not isinstance(raw_reqs, list) or not raw_reqs:
-        raise HTTPException(400, "`requirements` must be a non-empty list")
-
-    if "Requirements" in (raw_reqs[0] or {}):
-        reqs_dict = raw_reqs
-    else:
-        reqs_dict = _reqs_to_dicts([RequirementInput(**r) for r in raw_reqs])
-
-    tm_rows_raw: List[Dict[str, Any]] = tm_infer.tm_predict(reqs_dict, ha_rows, dvp_rows)
-
-    tm_rows_norm = [_normalize_tm_row_api(r) for r in tm_rows_raw]
-
-    result = guard_tm_rows(tm_rows_norm, allowed_methods=DEFAULT_ALLOWED_METHODS)
-    if not result.ok:
-        pass
-
-    return {
-        "trace_matrix": [TraceMatrixRow(**row) for row in tm_rows_norm]  # type: ignore
-    }
+@app.post("/trace-matrix", response_model=TraceMatrixOutput, dependencies=[Depends(require_auth)])
+def trace_matrix(payload: Dict[str, Any]):
+    try:
+        raw_reqs = payload.get("requirements", [])
+        ha_rows = payload.get("ha", [])
+        dvp_rows = payload.get("dvp", [])
+        if not isinstance(raw_reqs, list) or not raw_reqs:
+            raise HTTPException(400, "`requirements` must be a non-empty list")
+        reqs_dict = raw_reqs if "Requirements" in (raw_reqs[0] or {}) else _reqs_to_dicts(raw_reqs)
+        tm_rows_raw: List[Dict[str, Any]] = tm_infer.tm_predict(reqs_dict, ha_rows, dvp_rows)
+        tm_rows_norm = [_normalize_tm_row_api(r) for r in tm_rows_raw]
+        result = guard_tm_rows(tm_rows_norm, allowed_methods=DEFAULT_ALLOWED_METHODS)
+        # (Optional) log result.issues here
+        return {"trace_matrix": [TraceMatrixRow(**row) for row in tm_rows_norm]}  # type: ignore
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"TM failed: {e}")
