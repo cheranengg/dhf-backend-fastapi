@@ -1,37 +1,8 @@
-from typing import List, Dict, Any
+# app/models/dvp_infer.py
+from __future__ import annotations
 
-def dvp_predict(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]]):
-    # TODO: port your DVP LangChain + LoRA logic here
-    # For now, return empty list to keep the API shape stable
-    return []
-
-# ======================
-# app/models/tm_infer.py (stub)
-# ======================
-from typing import List, Dict, Any
-
-def tm_predict(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]], dvp: List[Dict[str, Any]]):
-    # TODO: call your fine-tuned Trace Matrix model here
-    # For now, map minimal structure tying reqs to empty HA/DVP
-    rows = []
-    for r in requirements:
-        rows.append({
-            "verification_id": r.get("Verification ID", ""),
-            "requirement_id": r.get("Requirement ID", ""),
-            "requirements": r.get("Requirements", ""),
-            "risk_ids": "",
-            "risks_to_health": "",
-            "ha_risk_controls": "",
-            "verification_method": "",
-            "acceptance_criteria": "",
-        })
-    return rows
-
-
-# ======================
-# app/models/dvp_infer.py (implementation)
-# ======================
-import os, json, re
+import os
+import json
 from typing import List, Dict, Any
 
 import torch
@@ -47,20 +18,26 @@ except Exception:
 
 # ---------------- Config ----------------
 # Point to your fine-tuned DVP checkpoint directory (merged weights or LoRA-merged)
-DVP_MODEL_DIR = os.getenv("DVP_MODEL_DIR", "/models/mistral_finetuned_Design_Verification_Protocol")
+# Override via env var in Cloud Run: DVP_MODEL_DIR=/models/mistral_finetuned_Design_Verification_Protocol
+DVP_MODEL_DIR = os.getenv(
+    "DVP_MODEL_DIR",
+    "/models/mistral_finetuned_Design_Verification_Protocol"
+)
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 
 # ---------------- Globals ----------------
-_tokenizer = None
-_model = None
-_emb_model = None
+_tokenizer: AutoTokenizer | None = None
+_model: AutoModelForCausalLM | None = None
+_emb_model: SentenceTransformer | None = None
 _faiss_index = None
 _faiss_texts: List[str] = []
 
 # ---------------- Heuristics & Lookups ----------------
 USABILITY_KWS = ["usability", "user", "human factors", "ui", "interface"]
-VISUAL_KWS = ["label", "marking", "display", "visual", "color"]
-TECH_KWS = ["electrical", "mechanical", "flow", "pressure", "occlusion", "accuracy", "alarm"]
+VISUAL_KWS    = ["label", "marking", "display", "visual", "color"]
+TECH_KWS      = ["electrical", "mechanical", "flow", "pressure", "occlusion", "accuracy", "alarm"]
 
 TEST_SPEC_LOOKUP = {
     "insulation": "≥ 50 MΩ at 500 V DC (IEC 60601-1)",
@@ -86,15 +63,14 @@ def _get_verification_method(req_text: str) -> str:
         return "Physical Testing"
     return "Physical Inspection"
 
-
 def _get_sample_size(requirement_id: str, ha_items: List[Dict[str, Any]]) -> str:
-    # Prefer severity from HA (same Requirement ID); fallback heuristic by digits in ID
+    """Prefer severity from HA (same Requirement ID); fallback heuristic by digits in ID."""
     sev = None
-    for h in ha_items:
-        if str(h.get("requirement_id")) == str(requirement_id) or str(h.get("Requirement ID")) == str(requirement_id):
+    for h in ha_items or []:
+        if str(h.get("requirement_id") or h.get("Requirement ID")) == str(requirement_id):
             s = h.get("severity_of_harm") or h.get("Severity of Harm")
             try:
-                s_int = int(s)
+                s_int = int(str(s))
                 sev = s_int if (sev is None or s_int > sev) else sev
             except Exception:
                 continue
@@ -111,14 +87,19 @@ def _load_model():
     global _tokenizer, _model, _emb_model
     if _model is not None:
         return
+
+    if not os.path.isdir(DVP_MODEL_DIR):
+        raise RuntimeError(f"DVP model dir not found: {DVP_MODEL_DIR}")
+
     _tokenizer = AutoTokenizer.from_pretrained(DVP_MODEL_DIR)
     if _tokenizer.pad_token is None:
         _tokenizer.pad_token = _tokenizer.eos_token
-    _model = AutoModelForCausalLM.from_pretrained(
-        DVP_MODEL_DIR,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto",
-    )
+
+    # ✅ CPU/GPU-safe: explicit dtype + move to device; avoid device_map="auto"
+    _model = AutoModelForCausalLM.from_pretrained(DVP_MODEL_DIR, torch_dtype=DTYPE)
+    _model.to(DEVICE)
+
+    # Embedding model is optional; don't fail the service if unavailable
     try:
         _emb_model = SentenceTransformer("all-MiniLM-L6-v2")
     except Exception:
@@ -128,48 +109,39 @@ def _load_model():
 def _gen_test_procedure(requirement_text: str) -> str:
     """Use the fine-tuned DVP model to produce 3–4 measurable bullets."""
     _load_model()
-    prompt = (
-        "You are a compliance engineer.
-"
-        "Generate ONLY a Design Verification Test Procedure for the following requirement.
+    prompt = f"""You are a compliance engineer.
 
-"
-        f"Requirement: {requirement_text}
+Generate ONLY a Design Verification Test Procedure for the following requirement.
 
-"
-        "- Limit output strictly to this requirement.
-"
-        "- Do NOT include unrelated tests.
-"
-        "- Output exactly 3–4 bullet points.
-"
-        "- Each bullet must include measurable values (units, thresholds, counts).
-"
-    )
-    inputs = _tokenizer(prompt, return_tensors="pt").to(DEVICE)
+Requirement: {requirement_text}
+
+- Limit output strictly to this requirement.
+- Do NOT include unrelated tests.
+- Output exactly 3–4 bullet points.
+- Each bullet must include measurable values (units, thresholds, counts).
+"""
+    inputs = _tokenizer(prompt, return_tensors="pt").to(DEVICE)  # type: ignore[arg-type]
     with torch.no_grad():
-        outputs = _model.generate(
+        outputs = _model.generate(  # type: ignore[union-attr]
             **inputs,
             max_new_tokens=320,
             temperature=0.3,
             do_sample=True,
             top_p=0.9,
         )
-    decoded = _tokenizer.decode(outputs[0], skip_special_tokens=True)
+    decoded = _tokenizer.decode(outputs[0], skip_special_tokens=True)  # type: ignore[union-attr]
+
     bullets: List[str] = []
-    for line in decoded.split("
-"):
-        s = line.strip(" -•	")
+    for line in decoded.split("\n"):
+        s = line.strip(" -•\t")
         if s and len(s.split()) > 3:
             bullets.append(f"- {s}")
         if len(bullets) == 4:
             break
-    return "
-".join(bullets) if bullets else "TBD"
-
+    return "\n".join(bullets) if bullets else "TBD"
 
 def _hybrid_enrich(requirement_text: str) -> Dict[str, str]:
-    """Combine model bullets with standards snippets and (optionally) nearest-neighbor examples."""
+    """Combine model bullets with standards snippets (simple keyword-based assistance)."""
     bullets = _gen_test_procedure(requirement_text)
     std_hint = None
     lt = requirement_text.lower()
@@ -182,31 +154,44 @@ def _hybrid_enrich(requirement_text: str) -> Dict[str, str]:
 
 # ---------------- Public API ----------------
 def dvp_predict(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]]):
-    """Return a list of DVP rows for each input requirement."""
+    """
+    Return a list of DVP rows for each input requirement.
+    Input `requirements` should be canonical dicts with keys:
+    - Requirement ID, Verification ID, Requirements
+    """
     _load_model()
     rows: List[Dict[str, Any]] = []
+
     for r in requirements:
-        rid = str(r.get("Requirement ID", ""))
-        vid = str(r.get("Verification ID", ""))
+        rid = str(r.get("Requirement ID", "") or "")
+        vid = str(r.get("Verification ID", "") or "")
         rtxt = r.get("Requirements", "") or ""
-        # Section headings → NA
+
+        # Section headings like "Functional Requirements" → NA row
         if rtxt.strip().lower().endswith("requirements") and not vid:
             rows.append({
                 "verification_id": vid,
+                "requirement_id": rid,
+                "requirements": rtxt,
                 "verification_method": "NA",
-                "acceptance_criteria": "NA",
                 "sample_size": "NA",
                 "test_procedure": "NA",
+                "acceptance_criteria": "NA",
             })
             continue
-        method = _get_verification_method(rtxt)
-        sample = _get_sample_size(rid, ha)
+
+        method  = _get_verification_method(rtxt)
+        sample  = _get_sample_size(rid, ha or [])
         enriched = _hybrid_enrich(rtxt)
+
         rows.append({
             "verification_id": vid,
+            "requirement_id": rid,
+            "requirements": rtxt,
             "verification_method": method or "NA",
-            "acceptance_criteria": enriched.get("Acceptance Criteria", "TBD"),
             "sample_size": sample or "NA",
             "test_procedure": enriched.get("Test Procedure", "TBD"),
+            "acceptance_criteria": enriched.get("Acceptance Criteria", "TBD"),
         })
+
     return rows
