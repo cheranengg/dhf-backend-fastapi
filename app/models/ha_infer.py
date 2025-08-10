@@ -4,6 +4,33 @@ from __future__ import annotations
 import os, re, json
 from typing import List, Dict, Any, Optional
 
+# --- add near top, after imports and defaults ---
+def _fallback_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows = []
+    default_risks = [
+        "Air Embolism","Allergic response","Infection","Overdose","Underdose",
+        "Delay of therapy","Environmental Hazard","Incorrect Therapy","Trauma","Particulate",
+    ]
+    for r in requirements:
+        rid = r.get("Requirement ID") or ""
+        for risk in default_risks:
+            rows.append({
+                "requirement_id": rid,
+                "risk_id": f"HA-{abs(hash(risk + rid)) % 10_000:04}",
+                "risk_to_health": risk,
+                "hazard": "Not available",
+                "hazardous_situation": "Not available",
+                "harm": "Not available",
+                "sequence_of_events": "Not available",
+                "severity_of_harm": 3,
+                "p0": "Medium",
+                "p1": "Medium",
+                "poh": "Medium",
+                "risk_index": "Medium",
+                "risk_control": f"Refer to IEC 60601 / ISO 14971 (nearest req: {rid})" if rid else "Refer to IEC 60601 / ISO 14971",
+            })
+    return rows
+
 # ---- Toggle heavy model usage (safe default off for Cloud Run CPU) ----
 USE_HA_MODEL = os.getenv("USE_HA_MODEL", "0") == "1"
 
@@ -169,6 +196,9 @@ def _nearest_req_control(reqs: List[Dict[str, Any]], hint_text: str) -> str:
         return "Refer to IEC 60601 and ISO 14971 risk controls"
 
 def ha_predict(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not USE_HA_MODEL:
+        return _fallback_ha(requirements)
+    _load_model()
     """
     Generate HA rows tied to each requirement.
     """
