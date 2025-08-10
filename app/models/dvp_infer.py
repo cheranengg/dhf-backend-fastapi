@@ -2,14 +2,23 @@
 from __future__ import annotations
 
 import os
-import json
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from sentence_transformers import SentenceTransformer
+# ---- Toggle heavy model use (safe default OFF for Cloud Run CPU) ----
+USE_DVP_MODEL = os.getenv("USE_DVP_MODEL", "0") == "1"
 
-# Optional: FAISS for retrieval of prior procedures (if you mount a dataset)
+# Import heavy libs only if we will use them
+if USE_DVP_MODEL:
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# Optional (do not fail if missing)
+try:
+    from sentence_transformers import SentenceTransformer
+    _HAS_EMB = True
+except Exception:
+    _HAS_EMB = False
+
 try:
     import faiss  # type: ignore
     _HAS_FAISS = True
@@ -17,20 +26,19 @@ except Exception:
     _HAS_FAISS = False
 
 # ---------------- Config ----------------
-# Point to your fine-tuned DVP checkpoint directory (merged weights or LoRA-merged)
-# Override via env var in Cloud Run: DVP_MODEL_DIR=/models/mistral_finetuned_Design_Verification_Protocol
 DVP_MODEL_DIR = os.getenv(
     "DVP_MODEL_DIR",
     "/models/mistral_finetuned_Design_Verification_Protocol"
 )
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
+if USE_DVP_MODEL:
+    DEVICE = "cuda" if getattr(__import__("torch"), "cuda").is_available() else "cpu"
+    DTYPE = getattr(__import__("torch"), "float16") if DEVICE == "cuda" else getattr(__import__("torch"), "float32")
 
 # ---------------- Globals ----------------
-_tokenizer: AutoTokenizer | None = None
-_model: AutoModelForCausalLM | None = None
-_emb_model: SentenceTransformer | None = None
+_tokenizer: Optional["AutoTokenizer"] = None
+_model: Optional["AutoModelForCausalLM"] = None
+_emb_model: Optional["SentenceTransformer"] = None
 _faiss_index = None
 _faiss_texts: List[str] = []
 
@@ -84,31 +92,36 @@ def _get_sample_size(requirement_id: str, ha_items: List[Dict[str, Any]]) -> str
 
 # ---------------- Model loader ----------------
 def _load_model():
+    """Load the DVP generator only when USE_DVP_MODEL=1."""
     global _tokenizer, _model, _emb_model
+    if not USE_DVP_MODEL:
+        return
     if _model is not None:
         return
 
     if not os.path.isdir(DVP_MODEL_DIR):
         raise RuntimeError(f"DVP model dir not found: {DVP_MODEL_DIR}")
 
+    from transformers import AutoTokenizer, AutoModelForCausalLM  # local import
+    import torch
+
     _tokenizer = AutoTokenizer.from_pretrained(DVP_MODEL_DIR)
     if _tokenizer.pad_token is None:
         _tokenizer.pad_token = _tokenizer.eos_token
 
-    # ✅ CPU/GPU-safe: explicit dtype + move to device; avoid device_map="auto"
     _model = AutoModelForCausalLM.from_pretrained(DVP_MODEL_DIR, torch_dtype=DTYPE)
     _model.to(DEVICE)
 
-    # Embedding model is optional; don't fail the service if unavailable
     try:
         _emb_model = SentenceTransformer("all-MiniLM-L6-v2")
     except Exception:
         _emb_model = None
 
 # ---------------- Generation helpers ----------------
-def _gen_test_procedure(requirement_text: str) -> str:
-    """Use the fine-tuned DVP model to produce 3–4 measurable bullets."""
+def _gen_test_procedure_model(requirement_text: str) -> str:
+    """Model-backed generation (only when USE_DVP_MODEL=1)."""
     _load_model()
+    import torch
     prompt = f"""You are a compliance engineer.
 
 Generate ONLY a Design Verification Test Procedure for the following requirement.
@@ -129,10 +142,9 @@ Requirement: {requirement_text}
             do_sample=True,
             top_p=0.9,
         )
-    decoded = _tokenizer.decode(outputs[0], skip_special_tokens=True)  # type: ignore[union-attr]
-
+    text = _tokenizer.decode(outputs[0], skip_special_tokens=True)  # type: ignore[union-attr]
     bullets: List[str] = []
-    for line in decoded.split("\n"):
+    for line in text.split("\n"):
         s = line.strip(" -•\t")
         if s and len(s.split()) > 3:
             bullets.append(f"- {s}")
@@ -140,11 +152,27 @@ Requirement: {requirement_text}
             break
     return "\n".join(bullets) if bullets else "TBD"
 
+def _gen_test_procedure_stub(requirement_text: str) -> str:
+    """Deterministic, no-weights stub for CPU smoke tests."""
+    req = (requirement_text or "").strip()
+    if not req:
+        req = "the feature"
+    return (
+        f"- Verify {req} at three setpoints; record measured values vs setpoint (n=3).\n"
+        f"- Confirm repeatability across 5 cycles; compute max deviation and standard deviation.\n"
+        f"- Perform boundary test at min/max operating conditions; log pass/fail against spec.\n"
+        f"- Document all equipment IDs and calibration dates; attach raw data."
+    )
+
+def _gen_test_procedure(requirement_text: str) -> str:
+    if USE_DVP_MODEL:
+        return _gen_test_procedure_model(requirement_text)
+    return _gen_test_procedure_stub(requirement_text)
+
 def _hybrid_enrich(requirement_text: str) -> Dict[str, str]:
-    """Combine model bullets with standards snippets (simple keyword-based assistance)."""
     bullets = _gen_test_procedure(requirement_text)
     std_hint = None
-    lt = requirement_text.lower()
+    lt = (requirement_text or "").lower()
     for kw, spec in TEST_SPEC_LOOKUP.items():
         if kw in lt:
             std_hint = spec
@@ -157,11 +185,12 @@ def dvp_predict(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]]):
     """
     Return a list of DVP rows for each input requirement.
     Input `requirements` should be canonical dicts with keys:
-    - Requirement ID, Verification ID, Requirements
+      - Requirement ID, Verification ID, Requirements
     """
+    # Only loads the model when flag is on
     _load_model()
-    rows: List[Dict[str, Any]] = []
 
+    rows: List[Dict[str, Any]] = []
     for r in requirements:
         rid = str(r.get("Requirement ID", "") or "")
         vid = str(r.get("Verification ID", "") or "")
@@ -180,8 +209,8 @@ def dvp_predict(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]]):
             })
             continue
 
-        method  = _get_verification_method(rtxt)
-        sample  = _get_sample_size(rid, ha or [])
+        method   = _get_verification_method(rtxt)
+        sample   = _get_sample_size(rid, ha or [])
         enriched = _hybrid_enrich(rtxt)
 
         rows.append({
