@@ -1,23 +1,14 @@
-# FastAPI & server
-fastapi
-uvicorn[standard]
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
 pydantic<2
-
-# LLM stack
-transformers
-accelerate
-peft
-sentence-transformers
-faiss-cpu
-
-# Orchestration / validation (optional but used in your code)
-langchain
-langchain-community
-guardrails-ai
-
-# Utilities
-numpy
-requests
-
-# If your backend needs Drive access (usually not):
-# pydrive2
+transformers==4.55.0
+accelerate==1.10.0
+peft==0.17.0
+sentence-transformers==5.1.0
+faiss-cpu==1.11.0.post1
+langchain==0.2.17
+langchain-community==0.2.19
+guardrails-ai==0.4.5
+numpy==1.26.4
+requests==2.32.4
+torch==2.5.1        # CPU wheel from PyPI
