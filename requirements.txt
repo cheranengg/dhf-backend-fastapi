@@ -1,16 +1,26 @@
-# Web API
+# --- Core runtime ---
 fastapi==0.116.1
 uvicorn[standard]==0.35.0
 pydantic<2
 
-# Core ML stack (model loading/generation)
+# --- PyTorch (CPU wheels) ---
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1
+# torchvision / torchaudio not required for current code
+
+# --- Transformers / LoRA ---
 transformers==4.55.0
 peft==0.17.0
-# torch/torchvision/torchaudio are installed in Docker via the CUDA index
 
-# Optional local similarity (both are used by ha_infer + optional)
+# --- Embeddings / similarity / LangChain utilities used in ha_infer.py ---
 sentence-transformers==5.1.0
 faiss-cpu==1.11.0.post1
+langchain==0.2.17
+langchain-community==0.2.19
+pypdf==4.3.1   # for PyPDFLoader if LOAD_WEB=1
 
-# Utilities
+# --- Pin to avoid resolver thrash & keep faiss/sklearn happy ---
+numpy==1.26.4
+
+# --- Misc ---
 requests==2.32.4
