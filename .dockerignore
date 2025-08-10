@@ -1,0 +1,49 @@
+# Ignore Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore local virtualenvs
+env/
+venv/
+.venv/
+
+# Ignore cache directories
+.cache/
+.cache/*
+/cache
+/cache/*
+
+# Ignore notebooks and training files
+*.ipynb
+/content/
+data/
+datasets/
+*.jsonl
+*.csv
+*.xlsx
+*.pdf
+
+# Ignore large model training checkpoints (but keep fine-tuned models for inference)
+*.bin
+*.safetensors
+*.ckpt
+
+# Keep only these model folders (for inference)
+!app/models/mistral_finetuned_*
+!app/models/**/*.json
+!app/models/**/*.txt
+!app/models/**/*.model
+
+# Ignore git & build artifacts
+.git
+.gitignore
+*.log
+*.tmp
+*.bak
+
+# Ignore IDE/editor config
+.vscode/
+.idea/
+*.swp
