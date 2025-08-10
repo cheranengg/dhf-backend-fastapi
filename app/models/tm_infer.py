@@ -4,23 +4,36 @@ from __future__ import annotations
 import os, json, re
 from typing import List, Dict, Any, Optional
 
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+# ---- Toggle heavy model use (safe default OFF for Cloud Run CPU) ----
+USE_TM_MODEL = os.getenv("USE_TM_MODEL", "0") == "1"
+
+if USE_TM_MODEL:
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # Prefer a merged finetuned folder baked into the image
 TM_MODEL_DIR = os.getenv("TM_MODEL_DIR", "/models/mistral_finetuned_Trace_Matrix")
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE  = torch.float16 if DEVICE == "cuda" else torch.float32
 
-_tokenizer: Optional[AutoTokenizer] = None
-_model: Optional[AutoModelForCausalLM] = None
+if USE_TM_MODEL:
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    DTYPE  = torch.float16 if DEVICE == "cuda" else torch.float32
+
+_tokenizer: Optional["AutoTokenizer"] = None
+_model: Optional["AutoModelForCausalLM"] = None
 
 _json_obj = re.compile(r"\{[\s\S]*?\}")
 
 def _load_tm_model():
+    """Load the TM generator only when USE_TM_MODEL=1."""
     global _tokenizer, _model
+    if not USE_TM_MODEL:
+        return
     if _model is not None:
         return
+    if not os.path.isdir(TM_MODEL_DIR):
+        raise RuntimeError(f"TM model dir not found: {TM_MODEL_DIR}")
+    from transformers import AutoTokenizer, AutoModelForCausalLM  # local import
+    import torch
     _tokenizer = AutoTokenizer.from_pretrained(TM_MODEL_DIR)
     if _tokenizer.pad_token is None:
         _tokenizer.pad_token = _tokenizer.eos_token
@@ -64,8 +77,26 @@ def _join_unique(values: List[str]) -> str:
             seen.append(v)
     return ", ".join(seen) if seen else "NA"
 
+def _compose_fallback(rid: str, vid: str, rtxt: str,
+                      ha_slice: List[Dict[str, Any]], drow: Dict[str, Any]) -> Dict[str, Any]:
+    risk_ids = _join_unique([h.get("risk_id") or h.get("Risk ID") or "" for h in ha_slice])
+    risks_to_health = _join_unique([h.get("risk_to_health") or h.get("Risk to Health") or "" for h in ha_slice])
+    risk_controls = _join_unique([h.get("risk_control") or h.get("HA Risk Control") or "" for h in ha_slice])
+    method = drow.get("verification_method") or drow.get("Verification Method") or "TBD - Human / SME input"
+    criteria = drow.get("acceptance_criteria") or drow.get("Acceptance Criteria") or "TBD - Human / SME input"
+    return {
+        "verification_id": vid,
+        "requirement_id": rid,
+        "requirements": rtxt,
+        "risk_ids": risk_ids if risk_ids != "NA" else "TBD - Human / SME input",
+        "risks_to_health": risks_to_health if risks_to_health != "NA" else "TBD - Human / SME input",
+        "ha_risk_controls": risk_controls if risk_controls != "NA" else "TBD - Human / SME input",
+        "verification_method": method,
+        "acceptance_criteria": criteria,
+    }
+
 def tm_predict(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]], dvp: List[Dict[str, Any]]):
-    """Generate Trace Matrix rows. Model should emit JSON; otherwise fall back."""
+    """Generate Trace Matrix rows. Uses model only if USE_TM_MODEL=1; else deterministic fallback."""
     _load_tm_model()
     rows: List[Dict[str, Any]] = []
 
@@ -102,18 +133,15 @@ def tm_predict(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]], dvp
             })
             continue
 
-        # Aggregate HA for this requirement
         ha_slice = ha_by_req.get(rid, [])
-        risk_ids = _join_unique([h.get("risk_id") or h.get("Risk ID") or "" for h in ha_slice])
-        risks_to_health = _join_unique([h.get("risk_to_health") or h.get("Risk to Health") or "" for h in ha_slice])
-        risk_controls = _join_unique([h.get("risk_control") or h.get("HA Risk Control") or "" for h in ha_slice])
-
-        # DVP slice
         drow = dvp_by_vid.get(vid, {})
-        method = drow.get("verification_method") or drow.get("Verification Method") or "TBD - Human / SME input"
-        criteria = drow.get("acceptance_criteria") or drow.get("Acceptance Criteria") or "TBD - Human / SME input"
 
-        # Prompt model (expects JSON)
+        # If model is disabled, always use fallback
+        if not USE_TM_MODEL:
+            rows.append(_compose_fallback(rid, vid, rtxt, ha_slice, drow))
+            continue
+
+        # Model path
         instruction = (
             "You are generating a Traceability Matrix row for an infusion pump.\n"
             "Return ONLY a single JSON object with keys: "
@@ -131,6 +159,7 @@ def tm_predict(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]], dvp
 
         parsed = None
         try:
+            import torch
             inputs = _tokenizer(prompt, return_tensors="pt").to(DEVICE)  # type: ignore
             with torch.no_grad():
                 outputs = _model.generate(  # type: ignore
@@ -146,31 +175,28 @@ def tm_predict(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]], dvp
             parsed = None
 
         if not parsed:
-            # Fallback composition
-            parsed = {
-                "verification_id": vid,
-                "requirement_id": rid,
-                "requirements": rtxt,
-                "risk_ids": risk_ids if risk_ids != "NA" else "TBD - Human / SME input",
-                "risks_to_health": risks_to_health if risks_to_health != "NA" else "TBD - Human / SME input",
-                "ha_risk_controls": risk_controls if risk_controls != "NA" else "TBD - Human / SME input",
-                "verification_method": method,
-                "acceptance_criteria": criteria,
-            }
-        else:
-            # Normalize & fill gaps
-            parsed.setdefault("verification_id", vid)
-            parsed.setdefault("requirement_id", rid)
-            parsed.setdefault("requirements", rtxt)
-            parsed.setdefault("risk_ids", risk_ids or "TBD - Human / SME input")
-            parsed.setdefault("risks_to_health", risks_to_health or "TBD - Human / SME input")
-            parsed.setdefault("ha_risk_controls", risk_controls or "TBD - Human / SME input")
-            parsed.setdefault("verification_method", method)
-            parsed.setdefault("acceptance_criteria", criteria)
+            rows.append(_compose_fallback(rid, vid, rtxt, ha_slice, drow))
+            continue
 
-            for k in ("risk_ids", "risks_to_health", "ha_risk_controls", "verification_method", "acceptance_criteria"):
-                if not str(parsed.get(k, "")).strip():
-                    parsed[k] = "TBD - Human / SME input"
+        # Normalize & fill gaps
+        risk_ids = _join_unique([h.get("risk_id") or h.get("Risk ID") or "" for h in ha_slice])
+        risks_to_health = _join_unique([h.get("risk_to_health") or h.get("Risk to Health") or "" for h in ha_slice])
+        risk_controls = _join_unique([h.get("risk_control") or h.get("HA Risk Control") or "" for h in ha_slice])
+        method = drow.get("verification_method") or drow.get("Verification Method") or "TBD - Human / SME input"
+        criteria = drow.get("acceptance_criteria") or drow.get("Acceptance Criteria") or "TBD - Human / SME input"
+
+        parsed.setdefault("verification_id", vid)
+        parsed.setdefault("requirement_id", rid)
+        parsed.setdefault("requirements", rtxt)
+        parsed.setdefault("risk_ids", risk_ids or "TBD - Human / SME input")
+        parsed.setdefault("risks_to_health", risks_to_health or "TBD - Human / SME input")
+        parsed.setdefault("ha_risk_controls", risk_controls or "TBD - Human / SME input")
+        parsed.setdefault("verification_method", method)
+        parsed.setdefault("acceptance_criteria", criteria)
+
+        for k in ("risk_ids", "risks_to_health", "ha_risk_controls", "verification_method", "acceptance_criteria"):
+            if not str(parsed.get(k, "")).strip():
+                parsed[k] = "TBD - Human / SME input"
 
         rows.append(parsed)
 
