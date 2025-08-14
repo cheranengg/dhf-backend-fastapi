@@ -1,22 +1,44 @@
 # startup_cleanup.py
-import shutil
-import os
+import os, shutil, glob
 
-def clear_model_cache():
-    """
-    Deletes the cached Hugging Face model folder for 'cheranengg/dhf-ha-merged'
-    from the HF Spaces temporary directory.
-    """
-    cache_dir = "/tmp/hf/models--cheranengg--dhf-ha-merged"
-    if os.path.exists(cache_dir):
-        print(f"🧹 Removing old cached model at {cache_dir} ...")
-        try:
-            shutil.rmtree(cache_dir)
-            print("✅ Cache cleared successfully.")
-        except Exception as e:
-            print(f"⚠️ Failed to clear cache: {e}")
-    else:
-        print(f"ℹ️ No cache folder found at {cache_dir}")
+def _remove(path: str):
+    try:
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        elif os.path.exists(path):
+            os.remove(path)
+    except Exception as e:
+        print(f"[startup] could not remove {path}: {e}")
 
-# This runs automatically on import
-clear_model_cache()
+def _purge_hf_cache():
+    cache_dir = (
+        os.environ.get("HF_HOME")
+        or os.environ.get("HF_HUB_CACHE")
+        or os.environ.get("HUGGINGFACE_HUB_CACHE")
+        or os.environ.get("TRANSFORMERS_CACHE")
+        or "/tmp/hf"
+    )
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except Exception:
+        pass
+
+    # Delete any partially downloaded model folders for our repos
+    patterns = [
+        os.path.join(cache_dir, "models--cheranengg--dhf-ha-merged*"),
+        os.path.join(cache_dir, "models--cheranengg--dhf-dvp-merged*"),
+        os.path.join(cache_dir, "models--cheranengg--dhf-tm-merged*"),
+    ]
+    for pat in patterns:
+        for p in glob.glob(pat):
+            _remove(p)
+
+    # (Optional) nuke HF transfer temp files
+    tmp_pat = os.path.join(cache_dir, "tmp*")
+    for p in glob.glob(tmp_pat):
+        _remove(p)
+
+    print(f"[startup] HF cache cleaned under: {cache_dir}")
+
+# Run immediately on import
+_purge_hf_cache()
