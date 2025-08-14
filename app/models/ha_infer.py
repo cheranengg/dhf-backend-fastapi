@@ -1,30 +1,19 @@
 from __future__ import annotations
-
-# ---------- HF cache bootstrap (robust + normalized) ----------
-from app.utils.cache_bootstrap import pick_hf_cache_dir
-CACHE_DIR = pick_hf_cache_dir()  # sets HF_* envs consistently and ensures writability
-
-# ---------- FastAPI app ----------
-import os, traceback
-from typing import Any, Dict, List
-from fastapi import FastAPI, Depends, HTTPException, Request, status
-from fastapi.middleware.cors import CORSMiddleware
-# ... (rest of your imports stay the same)
-
-
 import os, re, json
 from typing import List, Dict, Any, Optional
 
+# Disable hf_transfer if present
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+
 # ----------------- runtime switches & locations -----------------
 USE_HA_MODEL = os.getenv("USE_HA_MODEL", "0") == "1"
-
-# accept either HA_MODEL_MERGED_DIR or HA_MODEL_DIR
 HA_MODEL_DIR = os.getenv("HA_MODEL_MERGED_DIR", os.getenv("HA_MODEL_DIR", "")) or "/models/ha-merged"
 BASE_MODEL_ID = os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
 
-# HF cache & token propagated from main.py; still respect if provided
 HF_TOKEN = os.getenv("HF_TOKEN", None)
-CACHE_DIR = os.getenv("HF_HOME") or os.getenv("TRANSFORMERS_CACHE") or "/workspace/.cache/hf"
+
+from app.utils.cache_bootstrap import pick_hf_cache_dir
+CACHE_DIR = pick_hf_cache_dir()
 
 def _token_cache_kwargs():
     kw = {"cache_dir": CACHE_DIR}
@@ -98,23 +87,32 @@ def _calculate_risk_fields(parsed: Dict[str, Any]):
         risk_index = "Medium"
     return severity, p0, p1, poh, risk_index
 
+def _load_tokenizer():
+    # Always from the base model → avoids bad tokenizer.json in merged repos
+    from transformers import AutoTokenizer
+    try:
+        return AutoTokenizer.from_pretrained(BASE_MODEL_ID, use_fast=True, **_token_cache_kwargs())
+    except Exception:
+        return AutoTokenizer.from_pretrained(BASE_MODEL_ID, use_fast=False, **_token_cache_kwargs())
+
 # ----------------- model loading -----------------------------------
 def _load_model():
     global _tokenizer, _model, _emb
     if not USE_HA_MODEL or _model is not None:
         return
-    # prefer merged dir / repo-id; fall back to base only if provided & allowed
-    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from transformers import AutoModelForCausalLM
     import torch
     dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
-    src = HA_MODEL_DIR if HA_MODEL_DIR else BASE_MODEL_ID
-    _tokenizer = AutoTokenizer.from_pretrained(src, **_token_cache_kwargs())  # type: ignore
+    _tokenizer = _load_tokenizer()
     if _tokenizer.pad_token is None:
         _tokenizer.pad_token = _tokenizer.eos_token
-    _model = AutoModelForCausalLM.from_pretrained(src, torch_dtype=dtype, **_token_cache_kwargs())  # type: ignore
+
+    # Weights from merged HA repo
+    src = HA_MODEL_DIR if HA_MODEL_DIR else BASE_MODEL_ID
+    _model = AutoModelForCausalLM.from_pretrained(src, torch_dtype=dtype, **_token_cache_kwargs())
     _model.to("cuda" if torch.cuda.is_available() else "cpu")
-    # embeddings (best-effort)
+
     if _HAS_EMB:
         try:
             _emb = SentenceTransformer("all-MiniLM-L6-v2", cache_folder=CACHE_DIR)  # type: ignore
