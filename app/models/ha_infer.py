@@ -21,6 +21,7 @@ CACHE_DIR  = os.getenv("HF_HOME") or os.getenv("TRANSFORMERS_CACHE") or "/tmp/hf
 os.makedirs(CACHE_DIR, exist_ok=True)
 # Disable hf_transfer unless user opts in (avoids missing wheel error)
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # quieter + avoids extra threads
 
 def _token_cache_kwargs() -> Dict[str, Any]:
     kw: Dict[str, Any] = {"cache_dir": CACHE_DIR}
@@ -159,13 +160,32 @@ def _load_tokenizer():
     # 1) Your merged HA repo (preferred)
     if HA_MODEL_DIR:
         sources.append(HA_MODEL_DIR)
-    # 2) Optional base model if explicitly provided
+    # 2) Optional base model only if explicitly provided (we won't rely on it)
     if BASE_MODEL_ID:
         sources.append(BASE_MODEL_ID)
 
+    # Try slow tokenizer first to avoid tokenizer.json parsing issues
     for src in sources:
         try:
-            tok = AutoTokenizer.from_pretrained(src, use_fast=True, **_token_cache_kwargs())  # type: ignore
+            tok = AutoTokenizer.from_pretrained(
+                src,
+                use_fast=False,              # <— prefer slow tokenizer
+                legacy=False,                # safe default
+                **_token_cache_kwargs()
+            )  # type: ignore
+            _tokenizer = tok
+            return _tokenizer
+        except Exception as e:
+            last_exc = e
+
+    # If slow failed everywhere, try fast as a fallback
+    for src in sources:
+        try:
+            tok = AutoTokenizer.from_pretrained(
+                src,
+                use_fast=True,
+                **_token_cache_kwargs()
+            )  # type: ignore
             _tokenizer = tok
             return _tokenizer
         except Exception as e:
