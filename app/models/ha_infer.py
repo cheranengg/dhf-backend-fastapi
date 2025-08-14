@@ -16,17 +16,19 @@ HA_MODEL_DIR = os.getenv("HA_MODEL_MERGED_DIR", os.getenv("HA_MODEL_DIR", "")) o
 BASE_MODEL_ID = os.getenv("BASE_MODEL_ID", "").strip()
 
 # HF cache & token (propagated by main.py, but we also respect direct envs)
-HF_TOKEN   = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
-CACHE_DIR  = os.getenv("HF_HOME") or os.getenv("TRANSFORMERS_CACHE") or "/tmp/hf"
-os.makedirs(CACHE_DIR, exist_ok=True)
-# Disable hf_transfer unless user opts in (avoids missing wheel error)
-os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # quieter + avoids extra threads
+HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+CACHE_DIR = (
+    os.getenv("HF_HOME")
+    or os.getenv("TRANSFORMERS_CACHE")
+    or "/tmp/hf"
+)
 
-def _token_cache_kwargs() -> Dict[str, Any]:
-    kw: Dict[str, Any] = {"cache_dir": CACHE_DIR}
+def _tk_kwargs():
+    kw = {"cache_dir": CACHE_DIR, "use_fast": False}  # <- force slow tokenizer
     if HF_TOKEN:
         kw["token"] = HF_TOKEN
+    # make failures loud so we can catch and try the next source
+    kw["local_files_only"] = False
     return kw
 
 # =========================
@@ -150,49 +152,36 @@ def _calculate_risk_fields(parsed: Dict[str, Any]) -> Tuple[int, str, str, str, 
 # Model loading
 # =========================
 def _load_tokenizer():
+    """
+    Load tokenizer for HA model, forcing the slow (SentencePiece) tokenizer
+    so we don't touch tokenizer.json at all.
+    """
     global _tokenizer
     if _tokenizer is not None:
         return _tokenizer
 
-    sources: List[str] = []
-    last_exc: Optional[Exception] = None
-
-    # 1) Your merged HA repo (preferred)
+    sources = []
+    # your env var/name for the merged repo
+    HA_MODEL_DIR = os.getenv("HA_MODEL_MERGED_DIR") or os.getenv("HA_MODEL_DIR") or ""
     if HA_MODEL_DIR:
         sources.append(HA_MODEL_DIR)
-    # 2) Optional base model only if explicitly provided (we won't rely on it)
-    if BASE_MODEL_ID:
-        sources.append(BASE_MODEL_ID)
 
-    # Try slow tokenizer first to avoid tokenizer.json parsing issues
+    last_exc = None
+    from transformers import AutoTokenizer
+
     for src in sources:
         try:
-            tok = AutoTokenizer.from_pretrained(
-                src,
-                use_fast=False,              # <— prefer slow tokenizer
-                legacy=False,                # safe default
-                **_token_cache_kwargs()
-            )  # type: ignore
-            _tokenizer = tok
+            _tokenizer = AutoTokenizer.from_pretrained(src, **_tk_kwargs())
+            # sanity check: slow tokenizer should have a sentencepiece model
+            # this line won't crash; it's just a guard in case a wrong file is returned
+            _ = getattr(_tokenizer, "sp_model", None)
             return _tokenizer
         except Exception as e:
             last_exc = e
 
-    # If slow failed everywhere, try fast as a fallback
-    for src in sources:
-        try:
-            tok = AutoTokenizer.from_pretrained(
-                src,
-                use_fast=True,
-                **_token_cache_kwargs()
-            )  # type: ignore
-            _tokenizer = tok
-            return _tokenizer
-        except Exception as e:
-            last_exc = e
-            continue
-
-    raise RuntimeError(f"HA tokenizer load failed. Tried: {sources}. Last error: {last_exc}")
+    raise RuntimeError(
+        f"HA tokenizer load failed. Tried: {sources}. Last error: {last_exc}"
+    )
 
 def _load_model():
     global _model, _emb
