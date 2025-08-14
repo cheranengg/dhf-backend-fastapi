@@ -1,40 +1,20 @@
 from __future__ import annotations
 
 # ---------- HF cache bootstrap (safe defaults) ----------
-import os, errno
+import os
 
-def _first_nonempty(*vals):
-    for v in vals:
-        if v: return v
-    return None
-
-# 1) start from env or sensible default
-_cfg_path = _first_nonempty(
-    os.environ.get("HF_HOME"),
-    os.environ.get("HF_HUB_CACHE"),
-    os.environ.get("HUGGINGFACE_HUB_CACHE"),
-    os.environ.get("TRANSFORMERS_CACHE"),
-    "/workspace/.cache/hf",
+# Use a writable cache dir in Spaces
+_cache = (
+    os.environ.get("HF_HOME")
+    or os.environ.get("HF_HUB_CACHE")
+    or os.environ.get("HUGGINGFACE_HUB_CACHE")
+    or os.environ.get("TRANSFORMERS_CACHE")
+    or "/tmp/hf"
 )
-
-# 2) try to make sure it's writable; otherwise fall back to /tmp/hf
-def _ensure_writable(p):
-    try:
-        os.makedirs(p, exist_ok=True)
-        testfile = os.path.join(p, ".write_test")
-        with open(testfile, "w") as f:
-            f.write("ok")
-        os.remove(testfile)
-        return p
-    except Exception:
-        return "/tmp/hf"
-
-_cache = _ensure_writable(_cfg_path)
 os.environ.setdefault("HF_HOME", _cache)
 os.environ.setdefault("HF_HUB_CACHE", _cache)
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", _cache)
 os.environ.setdefault("TRANSFORMERS_CACHE", _cache)
-os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")  # disable hf_transfer path (no pip dep in Space)
 os.makedirs(_cache, exist_ok=True)
 
 # ---------- FastAPI app ----------
@@ -65,7 +45,7 @@ def require_auth(request: Request):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid token")
 
 # -------- App --------
-app = FastAPI(title="DHF Backend (HA/DVP/TM)", version="1.1.0")
+app = FastAPI(title="DHF Backend (HA/DVP/TM)", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -137,31 +117,14 @@ def debug_flags():
         "USE_HA_MODEL": os.getenv("USE_HA_MODEL", "0"),
         "USE_DVP_MODEL": os.getenv("USE_DVP_MODEL", "0"),
         "USE_TM_MODEL": os.getenv("USE_TM_MODEL", "0"),
-        "BASE_MODEL_ID": os.getenv("BASE_MODEL_ID", ""),
         "HA_MODEL_MERGED_DIR": os.getenv("HA_MODEL_MERGED_DIR", os.getenv("HA_MODEL_DIR", "")),
         "DVP_MODEL_DIR": os.getenv("DVP_MODEL_DIR", ""),
         "TM_MODEL_DIR": os.getenv("TM_MODEL_DIR", ""),
+        "BASE_MODEL_ID": os.getenv("BASE_MODEL_ID", ""),  # visible, can be blank
         "HF_HOME": os.getenv("HF_HOME", ""),
-        "HF_HUB_ENABLE_HF_TRANSFER": os.getenv("HF_HUB_ENABLE_HF_TRANSFER", ""),
+        "HF_HUB_ENABLE_HF_TRANSFER": os.getenv("HF_HUB_ENABLE_HF_TRANSFER", "0"),
         "OMP_NUM_THREADS": os.getenv("OMP_NUM_THREADS", ""),
     }
-
-@app.get("/debug/models", dependencies=[Depends(require_auth)])
-def debug_models():
-    try:
-        ha = getattr(ha_infer, "get_status", lambda: {"loaded": False})()
-        dvp = getattr(dvp_infer, "get_status", lambda: {"loaded": False})()
-        tm  = getattr(tm_infer,  "get_status", lambda: {"loaded": False})()
-        return {"ok": True, "ha": ha, "dvp": dvp, "tm": tm}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-@app.get("/debug/ha_raw", dependencies=[Depends(require_auth)])
-def debug_ha_raw():
-    try:
-        return {"ok": True, **ha_infer.debug_one_sample()}
-    except Exception as e:
-        return {"ok": False, "error": str(e), "trace": traceback.format_exc()}
 
 @app.post("/debug/smoke", dependencies=[Depends(require_auth)])
 def debug_smoke():
@@ -210,6 +173,7 @@ def dvp(payload: Dict[str, Any]):
                 verification_method=row["verification_method"],
                 sample_size=int(row["sample_size"]) if row.get("sample_size", "").isdigit() else None,
                 acceptance_criteria=row["acceptance_criteria"],
+                test_procedure=row.get("test_procedure"),
             ) for row in dvp_rows_norm]
         }
     except HTTPException:
