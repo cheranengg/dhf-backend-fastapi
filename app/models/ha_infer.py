@@ -138,21 +138,20 @@ def _load_model():
         raise RuntimeError(f"HA model load failed: {e}")
 
 # ----------------- prompting -----------------
-_PROMPT = (
-    "You are generating a Hazard Analysis row for an infusion pump.\n"
-    "Return ONLY a single JSON object and no extra text.\n"
-    "Fields:\n"
-    "{\n"
-    '  "Hazard": "...",\n'
-    '  "Hazardous Situation": "...",\n'
-    '  "Harm": "...",\n'
-    '  "Sequence of Events": "...",\n'
-    '  "Severity of Harm": "Negligible|Minor|Moderate|Serious|Critical",\n'
-    '  "P0": "Very Low|Low|Medium|High|Very High",\n'
-    '  "P1": "Very Low|Low|Medium|High|Very High"\n"
-    "}\n"
-    "Risk to Health: {risk}\n"
-)
+_PROMPT = """You are generating a Hazard Analysis row for an infusion pump.
+Return ONLY a single JSON object and no extra text.
+Fields:
+{
+  "Hazard": "...",
+  "Hazardous Situation": "...",
+  "Harm": "...",
+  "Sequence of Events": "...",
+  "Severity of Harm": "Negligible|Minor|Moderate|Serious|Critical",
+  "P0": "Very Low|Low|Medium|High|Very High",
+  "P1": "Very Low|Low|Medium|High|Very High"
+}
+Risk to Health: {risk}
+"""
 
 def _gen_json_for_risk(risk: str) -> Dict[str, Any]:
     _load_model()
