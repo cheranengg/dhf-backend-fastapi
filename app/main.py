@@ -1,22 +1,40 @@
 from __future__ import annotations
 
 # ---------- HF cache bootstrap (safe defaults) ----------
-import os
+import os, errno
 
-# Respect anything you set in Space "Variables". If nothing is set,
-# use /workspace/.cache/hf which is writable in HF Spaces.
-_cache = (
-    os.environ.get("HF_HOME")
-    or os.environ.get("HF_HUB_CACHE")
-    or os.environ.get("HUGGINGFACE_HUB_CACHE")
-    or os.environ.get("TRANSFORMERS_CACHE")
-    or "/workspace/.cache/hf"
+def _first_nonempty(*vals):
+    for v in vals:
+        if v: return v
+    return None
+
+# 1) start from env or sensible default
+_cfg_path = _first_nonempty(
+    os.environ.get("HF_HOME"),
+    os.environ.get("HF_HUB_CACHE"),
+    os.environ.get("HUGGINGFACE_HUB_CACHE"),
+    os.environ.get("TRANSFORMERS_CACHE"),
+    "/workspace/.cache/hf",
 )
+
+# 2) try to make sure it's writable; otherwise fall back to /tmp/hf
+def _ensure_writable(p):
+    try:
+        os.makedirs(p, exist_ok=True)
+        testfile = os.path.join(p, ".write_test")
+        with open(testfile, "w") as f:
+            f.write("ok")
+        os.remove(testfile)
+        return p
+    except Exception:
+        return "/tmp/hf"
+
+_cache = _ensure_writable(_cfg_path)
 os.environ.setdefault("HF_HOME", _cache)
 os.environ.setdefault("HF_HUB_CACHE", _cache)
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", _cache)
 os.environ.setdefault("TRANSFORMERS_CACHE", _cache)
-os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")  # disable hf_transfer requirement
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")  # disable hf_transfer path (no pip dep in Space)
 os.makedirs(_cache, exist_ok=True)
 
 # ---------- FastAPI app ----------
