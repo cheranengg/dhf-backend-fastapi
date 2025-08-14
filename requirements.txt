@@ -1,21 +1,21 @@
-# --- Core runtime ---
-fastapi==0.116.1
-uvicorn[standard]==0.35.0
-pydantic<2
+# ---- Web framework ----
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
 
-# --- Transformers / LoRA ---
-transformers==4.55.0
-peft==0.17.0
+# ---- Core scientific stack ----
+numpy>=1.26
+scipy>=1.11
+pandas>=2.2.2
 
-# --- Embeddings / similarity / utilities used in ha_infer.py ---
-sentence-transformers==5.1.0
-faiss-cpu==1.11.0.post1
-langchain==0.2.17
-langchain-community==0.2.19
-pypdf==4.3.1
+# ---- HF / LLM stack ----
+transformers>=4.41,<4.45
+huggingface_hub>=0.23,<0.25
+accelerate>=0.29,<0.33
+safetensors>=0.4.3
+torch>=2.1,<2.4
+peft>=0.11.0
+sentence-transformers>=2.6.1
+faiss-cpu>=1.8.0
 
-# --- Pin to avoid resolver thrash ---
-numpy==1.26.4
-
-# --- Misc ---
-requests==2.32.4
+# FastAPI runs on Pydantic v2 by default
+pydantic>=2.6.0
