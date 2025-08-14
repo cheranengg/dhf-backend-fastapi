@@ -1,6 +1,25 @@
-# app/main.py
 from __future__ import annotations
-import os, traceback
+
+# ---------- HF cache bootstrap (safe defaults) ----------
+import os
+
+# Respect anything you set in Space "Variables". If nothing is set,
+# use /workspace/.cache/hf which is writable in HF Spaces.
+_cache = (
+    os.environ.get("HF_HOME")
+    or os.environ.get("HF_HUB_CACHE")
+    or os.environ.get("HUGGINGFACE_HUB_CACHE")
+    or os.environ.get("TRANSFORMERS_CACHE")
+    or "/workspace/.cache/hf"
+)
+os.environ.setdefault("HF_HOME", _cache)
+os.environ.setdefault("HF_HUB_CACHE", _cache)
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", _cache)
+os.environ.setdefault("TRANSFORMERS_CACHE", _cache)
+os.makedirs(_cache, exist_ok=True)
+
+# ---------- FastAPI app ----------
+import traceback
 from typing import Any, Dict, List
 from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,6 +36,7 @@ from app.models import ha_infer, dvp_infer, tm_infer
 
 # -------- Security --------
 BACKEND_TOKEN = os.getenv("BACKEND_TOKEN", "dev-token")
+
 def require_auth(request: Request):
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
@@ -96,11 +116,12 @@ def health():
 def debug_flags():
     return {
         "USE_HA_MODEL": os.getenv("USE_HA_MODEL", "0"),
+        "USE_DVP_MODEL": os.getenv("USE_DVP_MODEL", "0"),
+        "USE_TM_MODEL": os.getenv("USE_TM_MODEL", "0"),
+        "HA_MODEL_MERGED_DIR": os.getenv("HA_MODEL_MERGED_DIR", os.getenv("HA_MODEL_DIR", "")),
         "DVP_MODEL_DIR": os.getenv("DVP_MODEL_DIR", ""),
         "TM_MODEL_DIR": os.getenv("TM_MODEL_DIR", ""),
-        "HA_MODEL_MERGED_DIR": os.getenv("HA_MODEL_MERGED_DIR", ""),
-        "LORA_HA_DIR": os.getenv("LORA_HA_DIR", ""),
-        "BASE_MODEL_ID": os.getenv("BASE_MODEL_ID", ""),
+        "HF_HOME": os.getenv("HF_HOME", ""),
     }
 
 @app.post("/debug/smoke", dependencies=[Depends(require_auth)])
@@ -168,8 +189,7 @@ def trace_matrix(payload: Dict[str, Any]):
         reqs_dict = raw_reqs if "Requirements" in (raw_reqs[0] or {}) else _reqs_to_dicts(raw_reqs)
         tm_rows_raw: List[Dict[str, Any]] = tm_infer.tm_predict(reqs_dict, ha_rows, dvp_rows)
         tm_rows_norm = [_normalize_tm_row_api(r) for r in tm_rows_raw]
-        result = guard_tm_rows(tm_rows_norm, allowed_methods=DEFAULT_ALLOWED_METHODS)
-        # (Optional) log result.issues here
+        _ = guard_tm_rows(tm_rows_norm, allowed_methods=DEFAULT_ALLOWED_METHODS)  # optional
         return {"trace_matrix": [TraceMatrixRow(**row) for row in tm_rows_norm]}  # type: ignore
     except HTTPException:
         raise
