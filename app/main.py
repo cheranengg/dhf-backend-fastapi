@@ -1,22 +1,11 @@
 from __future__ import annotations
 
-# ---------- HF cache bootstrap (safe defaults) ----------
+# ---------- bootstrap cache + disable hf_transfer early ----------
 import os
-
-# Respect anything you set in Space "Variables". If nothing is set,
-# use /workspace/.cache/hf which is writable in HF Spaces.
-_cache = (
-    os.environ.get("HF_HOME")
-    or os.environ.get("HF_HUB_CACHE")
-    or os.environ.get("HUGGINGFACE_HUB_CACHE")
-    or os.environ.get("TRANSFORMERS_CACHE")
-    or "/workspace/.cache/hf"
-)
-os.environ.setdefault("HF_HOME", _cache)
-os.environ.setdefault("HF_HUB_CACHE", _cache)
-os.environ.setdefault("HUGGINGFACE_HUB_CACHE", _cache)
-os.environ.setdefault("TRANSFORMERS_CACHE", _cache)
-os.makedirs(_cache, exist_ok=True)
+from app.utils.cache_bootstrap import pick_hf_cache_dir
+CACHE_DIR = pick_hf_cache_dir()
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"  # ensure no hf_transfer required
+os.environ.setdefault("OMP_NUM_THREADS", "1")  # quiet libgomp warning
 
 # ---------- FastAPI app ----------
 import traceback
@@ -52,6 +41,10 @@ app.add_middleware(
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": "dhf-backend-fastapi-space", "cache_dir": CACHE_DIR}
 
 # -------- Helpers --------
 def _reqs_to_dicts(reqs: List[RequirementInput]) -> List[Dict[str, Any]]:
@@ -118,10 +111,13 @@ def debug_flags():
         "USE_HA_MODEL": os.getenv("USE_HA_MODEL", "0"),
         "USE_DVP_MODEL": os.getenv("USE_DVP_MODEL", "0"),
         "USE_TM_MODEL": os.getenv("USE_TM_MODEL", "0"),
+        "BASE_MODEL_ID": os.getenv("BASE_MODEL_ID", ""),
         "HA_MODEL_MERGED_DIR": os.getenv("HA_MODEL_MERGED_DIR", os.getenv("HA_MODEL_DIR", "")),
         "DVP_MODEL_DIR": os.getenv("DVP_MODEL_DIR", ""),
         "TM_MODEL_DIR": os.getenv("TM_MODEL_DIR", ""),
         "HF_HOME": os.getenv("HF_HOME", ""),
+        "HF_HUB_ENABLE_HF_TRANSFER": os.getenv("HF_HUB_ENABLE_HF_TRANSFER", ""),
+        "OMP_NUM_THREADS": os.getenv("OMP_NUM_THREADS", ""),
     }
 
 @app.post("/debug/smoke", dependencies=[Depends(require_auth)])
@@ -171,6 +167,7 @@ def dvp(payload: Dict[str, Any]):
                 verification_method=row["verification_method"],
                 sample_size=int(row["sample_size"]) if row.get("sample_size", "").isdigit() else None,
                 acceptance_criteria=row["acceptance_criteria"],
+                test_procedure=row["test_procedure"],
             ) for row in dvp_rows_norm]
         }
     except HTTPException:
