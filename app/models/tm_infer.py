@@ -1,36 +1,37 @@
 from __future__ import annotations
-
-# ---------- HF cache bootstrap (robust + normalized) ----------
-from app.utils.cache_bootstrap import pick_hf_cache_dir
-CACHE_DIR = pick_hf_cache_dir()  # sets HF_* envs consistently and ensures writability
-
-# ---------- FastAPI app ----------
-import os, traceback
-from typing import Any, Dict, List
-from fastapi import FastAPI, Depends, HTTPException, Request, status
-from fastapi.middleware.cors import CORSMiddleware
-# ... (rest of your imports stay the same)
-
 import os, json, re
 from typing import List, Dict, Any, Optional
 
+# Disable hf_transfer if present
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+
 USE_TM_MODEL = os.getenv("USE_TM_MODEL", "0") == "1"
 TM_MODEL_DIR = os.getenv("TM_MODEL_DIR", "/models/tm-merged")
+BASE_MODEL_ID = os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
 
 HF_TOKEN = os.getenv("HF_TOKEN", None)
-CACHE_DIR = os.getenv("HF_HOME") or os.getenv("TRANSFORMERS_CACHE") or "/workspace/.cache/hf"
+
+from app.utils.cache_bootstrap import pick_hf_cache_dir
+CACHE_DIR = pick_hf_cache_dir()
 def _token_cache_kwargs():
     kw = {"cache_dir": CACHE_DIR}
     if HF_TOKEN:
         kw["token"] = HF_TOKEN
     return kw
 
+def _load_tokenizer():
+    from transformers import AutoTokenizer
+    try:
+        return AutoTokenizer.from_pretrained(BASE_MODEL_ID, use_fast=True, **_token_cache_kwargs())
+    except Exception:
+        return AutoTokenizer.from_pretrained(BASE_MODEL_ID, use_fast=False, **_token_cache_kwargs())
+
 if USE_TM_MODEL:
     import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from transformers import AutoModelForCausalLM
 else:
     torch = None  # type: ignore
-    AutoTokenizer = AutoModelForCausalLM = None  # type: ignore
+    AutoModelForCausalLM = None  # type: ignore
 
 _tokenizer: Optional["AutoTokenizer"] = None
 _model: Optional["AutoModelForCausalLM"] = None
@@ -40,13 +41,13 @@ _json_obj = re.compile(r"\{[\s\S]*?\}")
 def _load_tm_model():
     global _tokenizer, _model
     if not USE_TM_MODEL or _model is not None: return
-    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from transformers import AutoModelForCausalLM
     import torch
     dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-    src = TM_MODEL_DIR
-    _tokenizer = AutoTokenizer.from_pretrained(src, **_token_cache_kwargs())  # type: ignore
+
+    _tokenizer = _load_tokenizer()
     if _tokenizer.pad_token is None: _tokenizer.pad_token = _tokenizer.eos_token
-    _model = AutoModelForCausalLM.from_pretrained(src, torch_dtype=dtype, **_token_cache_kwargs())  # type: ignore
+    _model = AutoModelForCausalLM.from_pretrained(TM_MODEL_DIR, torch_dtype=dtype, **_token_cache_kwargs())
     _model.to("cuda" if torch.cuda.is_available() else "cpu")
 
 def _extract_json(text: str) -> Optional[Dict[str, Any]]:
