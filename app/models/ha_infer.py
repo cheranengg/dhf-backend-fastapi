@@ -1,17 +1,12 @@
 from __future__ import annotations
-import os, re, json, sys
+import os, re, json
 from typing import List, Dict, Any, Optional
 
 # ----------------- switches & sources -----------------
 USE_HA_MODEL = os.getenv("USE_HA_MODEL", "0") == "1"
 
-# We only use the merged repo or local dir the user provides
-HA_MODEL_DIR = os.getenv("HA_MODEL_MERGED_DIR", "").strip()
-if not HA_MODEL_DIR:
-    # allow legacy name "HA_MODEL_DIR"
-    HA_MODEL_DIR = os.getenv("HA_MODEL_DIR", "").strip()
+HA_MODEL_DIR = os.getenv("HA_MODEL_MERGED_DIR", "").strip() or os.getenv("HA_MODEL_DIR", "").strip()
 
-# HF auth/cache
 HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
 CACHE_DIR = (
     os.getenv("HF_HOME")
@@ -21,18 +16,15 @@ CACHE_DIR = (
     or "/tmp/hf"
 )
 
-# Optional: reduce CPU threads if needed
 os.environ.setdefault("OMP_NUM_THREADS", os.getenv("OMP_NUM_THREADS", "8"))
 
 def _token_cache_kwargs():
-    kw = {"cache_dir": CACHE_DIR, "local_files_only": False}
+    kw = {"cache_dir": CACHE_DIR, "local_files_only": False, "resume_download": True}
     if HF_TOKEN:
         kw["token"] = HF_TOKEN
-    # hub can occasionally wobble; retries help first pull
-    kw["resume_download"] = True
     return kw
 
-# ----------------- optional embeddings for nearest req -----------------
+# ----------------- optional embeddings -----------------
 try:
     from sentence_transformers import SentenceTransformer  # type: ignore
     import faiss  # type: ignore
@@ -40,7 +32,6 @@ try:
 except Exception:
     _HAS_EMB = False
 
-# ----------------- guard imports behind switch -----------------
 _tokenizer = None
 _model = None
 _emb = None
@@ -49,19 +40,36 @@ _default_risks = [
     "Air Embolism","Allergic response","Infection","Overdose","Underdose",
     "Delay of therapy","Environmental Hazard","Incorrect Therapy","Trauma","Particulate",
 ]
-
 _severity_map = {"negligible": 1, "minor": 2, "moderate": 3, "serious": 4, "critical": 5}
 
-# robust JSON grabber (last object)
-_json_obj = re.compile(r"\{(?:[^{}]|(?R))*\}", re.DOTALL)
-
+# ----------------- JSON extraction (brace balancer) -----------------
 def _extract_json(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Return the last balanced {...} object in `text`, cleaned and parsed.
+    Works without recursive-regex features.
+    """
     if not text:
         return None
-    m = _json_obj.findall(text)
-    if not m:
+    last_obj = None
+    stack = []
+    start_idx = None
+
+    for i, ch in enumerate(text):
+        if ch == '{':
+            if not stack:
+                start_idx = i
+            stack.append('{')
+        elif ch == '}':
+            if stack:
+                stack.pop()
+                if not stack and start_idx is not None:
+                    candidate = text[start_idx:i+1]
+                    last_obj = candidate  # keep the last complete object
+
+    if not last_obj:
         return None
-    js = m[-1].replace("'", '"').replace("\\n", " ")
+
+    js = last_obj.replace("'", '"').replace("\\n", " ")
     js = re.sub(r"\s+", " ", js)
     js = re.sub(r",\s*\}", "}", js)
     js = re.sub(r",\s*\]", "]", js)
@@ -93,16 +101,11 @@ def _calculate_risk_fields(parsed: Dict[str, Any]):
 
 # ----------------- model loading (merged-only) -----------------
 def _load_model():
-    """
-    Load the merged fine-tuned model from HA_MODEL_MERGED_DIR only.
-    If anything fails we raise — no silent fallback to placeholders.
-    """
     global _tokenizer, _model, _emb
     if not USE_HA_MODEL:
         return
     if _model is not None:
         return
-
     if not HA_MODEL_DIR:
         raise RuntimeError("HA_MODEL_MERGED_DIR is not set.")
 
@@ -110,7 +113,6 @@ def _load_model():
         from transformers import AutoTokenizer, AutoModelForCausalLM
         import torch
 
-        # L4 supports bfloat16; T4 prefers float16; CPU = float32
         if torch.cuda.is_available():
             dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
         else:
@@ -147,17 +149,15 @@ _PROMPT = (
     '  "Sequence of Events": "...",\n'
     '  "Severity of Harm": "Negligible|Minor|Moderate|Serious|Critical",\n'
     '  "P0": "Very Low|Low|Medium|High|Very High",\n'
-    '  "P1": "Very Low|Low|Medium|High|Very High"\n'
+    '  "P1": "Very Low|Low|Medium|High|Very High"\n"
     "}\n"
     "Risk to Health: {risk}\n"
 )
 
 def _gen_json_for_risk(risk: str) -> Dict[str, Any]:
     _load_model()
-    from transformers import StoppingCriteria, StoppingCriteriaList
     import torch
 
-    # deterministic decoding to improve JSON rate
     device = "cuda" if torch.cuda.is_available() else "cpu"
     prompt = _PROMPT.format(risk=risk)
     inputs = _tokenizer(prompt, return_tensors="pt").to(device)  # type: ignore
@@ -166,7 +166,7 @@ def _gen_json_for_risk(risk: str) -> Dict[str, Any]:
         out = _model.generate(
             **inputs,
             max_new_tokens=220,
-            do_sample=False,        # << deterministic
+            do_sample=False,
             temperature=0.0,
             eos_token_id=_tokenizer.eos_token_id,
             pad_token_id=_tokenizer.pad_token_id,
@@ -174,7 +174,6 @@ def _gen_json_for_risk(risk: str) -> Dict[str, Any]:
     decoded = _tokenizer.decode(out[0], skip_special_tokens=True)  # type: ignore
     parsed = _extract_json(decoded)
     if not parsed:
-        # Let the caller see we failed rather than silently returning placeholders
         raise RuntimeError("Model did not return valid JSON")
     return parsed
 
@@ -198,7 +197,6 @@ def _nearest_req_control(reqs: List[Dict[str, Any]], hint_text: str) -> str:
 
 # ----------------- public API -----------------
 def _fallback_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # used ONLY when USE_HA_MODEL=0
     rows = []
     for r in requirements:
         rid = r.get("Requirement ID") or ""
@@ -249,7 +247,6 @@ def ha_predict(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     "risk_control": control,
                 })
             except Exception as e:
-                # Capture error and surface on the API by raising after the loop
                 last_exc = e
                 rows.append({
                     "requirement_id": rid,
@@ -267,7 +264,6 @@ def ha_predict(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     "risk_control": "Refer to IEC 60601 / ISO 14971",
                 })
 
-    # If everything failed on first warm-up, raise to show the cause instead of silent TBDs
     if all(row["hazard"] == "TBD" for row in rows) and last_exc is not None:
         raise RuntimeError(str(last_exc))
 
