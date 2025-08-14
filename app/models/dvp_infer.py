@@ -1,4 +1,16 @@
 from __future__ import annotations
+
+# ---------- HF cache bootstrap (robust + normalized) ----------
+from app.utils.cache_bootstrap import pick_hf_cache_dir
+CACHE_DIR = pick_hf_cache_dir()  # sets HF_* envs consistently and ensures writability
+
+# ---------- FastAPI app ----------
+import os, traceback
+from typing import Any, Dict, List
+from fastapi import FastAPI, Depends, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+# ... (rest of your imports stay the same)
+
 import os
 from typing import List, Dict, Any, Optional
 
