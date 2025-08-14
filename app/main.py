@@ -18,7 +18,7 @@ os.environ.setdefault("TRANSFORMERS_CACHE", _cache)
 os.makedirs(_cache, exist_ok=True)
 
 # ---------- FastAPI app ----------
-import startup_cleanup  # will auto-run cache clearing
+from models import startup_cleanup
 import traceback
 from typing import Any, Dict, List
 from fastapi import FastAPI, Depends, HTTPException, Request, status
