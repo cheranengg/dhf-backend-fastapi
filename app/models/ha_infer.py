@@ -1,28 +1,28 @@
 from __future__ import annotations
-import os, re, json, gc
+import os, re, json
 from typing import List, Dict, Any, Optional
 
-# ----------------- runtime switches & locations -----------------
-os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+# ================== Switches & locations ==================
 USE_HA_MODEL = os.getenv("USE_HA_MODEL", "0") == "1"
-FORCE_CPU    = os.getenv("FORCE_CPU", "0") == "1"
-GEN_DEBUG    = os.getenv("GEN_DEBUG", "0") == "1"
-
-# accept either HA_MODEL_MERGED_DIR or HA_MODEL_DIR
+# Use your merged model repo or on-disk path
 HA_MODEL_DIR = os.getenv("HA_MODEL_MERGED_DIR", os.getenv("HA_MODEL_DIR", "")) or "/models/ha-merged"
-BASE_MODEL_ID = os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
 
-# HF cache & token (main.py sets the dirs)
+# Writable cache with safe default
+CACHE_DIR = (
+    os.getenv("HF_HOME")
+    or os.getenv("TRANSFORMERS_CACHE")
+    or "/tmp/hf"
+)
+os.makedirs(CACHE_DIR, exist_ok=True)
+
 HF_TOKEN = os.getenv("HF_TOKEN", None)
-CACHE_DIR = os.getenv("HF_HOME") or os.getenv("TRANSFORMERS_CACHE") or "/workspace/.cache/hf"
-
 def _token_cache_kwargs():
-    kw = {"cache_dir": CACHE_DIR}
+    kw = {"cache_dir": CACHE_DIR, "trust_remote_code": True}
     if HF_TOKEN:
         kw["token"] = HF_TOKEN
     return kw
 
-# ----------------- optional embeddings (best-effort) ---------------
+# ================== Optional embeddings for retrieval ==================
 try:
     from sentence_transformers import SentenceTransformer  # type: ignore
     import faiss  # type: ignore
@@ -30,7 +30,7 @@ try:
 except Exception:
     _HAS_EMB = False
 
-# ----------------- torch & hf imports guarded ----------------------
+# ================== Torch / HF imports (guarded) ==================
 if USE_HA_MODEL:
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -38,81 +38,54 @@ else:
     torch = None  # type: ignore
     AutoTokenizer = AutoModelForCausalLM = None  # type: ignore
 
-# ----------------- module globals ----------------------------------
+# ================== Module globals ==================
 _tokenizer: Optional["AutoTokenizer"] = None
 _model: Optional["AutoModelForCausalLM"] = None
 _emb: Optional["SentenceTransformer"] = None
-_DEVICE: str = "cpu"
 
-_default_risks = [
+# Risks you used in Colab
+_DEFAULT_RISKS = [
     "Air Embolism","Allergic response","Infection","Overdose","Underdose",
     "Delay of therapy","Environmental Hazard","Incorrect Therapy","Trauma","Particulate",
 ]
 
-_severity_map = {"negligible": 1, "minor": 2, "moderate": 3, "serious": 4, "critical": 5}
+# (Light) Guardrails
+_SEVERITY_MAP = {"negligible":1, "minor":2, "moderate":3, "serious":4, "critical":5}
 
-_json_obj = re.compile(r"\{[\s\S]*?\}")
+# JSON extraction (take the LAST JSON block)
+_JSON_RE = re.compile(r"\{[\s\S]*?\}")
 
-# ---------- robust JSON extraction ----------
-def _extract_json_balanced(s: str) -> Optional[Dict[str, Any]]:
-    if not s: return None
-    m = re.findall(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", s, re.IGNORECASE)
-    if m:
-        cand = m[-1]
-    else:
-        i = len(s) - 1
-        while i >= 0 and s[i] != "}":
-            i -= 1
-        if i < 0: return None
-        depth = 0
-        end = i
-        start = -1
-        while i >= 0:
-            if s[i] == "}": depth += 1
-            elif s[i] == "{":
-                depth -= 1
-                if depth == 0:
-                    start = i
-                    break
-            i -= 1
-        if start < 0: return None
-        cand = s[start:end+1]
-    cand = cand.replace("\\n", " ")
-    cand = re.sub(r"\s+", " ", cand)
-    cand = re.sub(r",\s*\}", "}", cand)
-    cand = re.sub(r",\s*\]", "]", cand)
+def _extract_json(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    m = _JSON_RE.findall(text)
+    if not m:
+        return None
+    js = m[-1]
+    js = js.replace("'", '"').replace("\\n", " ")
+    js = re.sub(r"\s+", " ", js)
+    js = re.sub(r",\s*\}", "}", js)
+    js = re.sub(r",\s*\]", "]", js)
     try:
-        return json.loads(cand)
+        return json.loads(js)
     except Exception:
         return None
 
-def _extract_json(text: str) -> Optional[Dict[str, Any]]:
-    if not text: return None
-    m = _json_obj.findall(text)
-    if m:
-        js = m[-1].replace("'", '"').replace("\\n", " ")
-        js = re.sub(r"\s+", " ", js)
-        js = re.sub(r",\s*\}", "}", js)
-        js = re.sub(r",\s*\]", "]", js)
-        try:
-            return json.loads(js)
-        except Exception:
-            pass
-    return _extract_json_balanced(text)
-
 def _calculate_risk_fields(parsed: Dict[str, Any]):
-    sev_txt = str(parsed.get("Severity of Harm", "Moderate")).lower()
-    severity = _severity_map.get(sev_txt, 3)
+    """Your ISO 14971 guardrail logic."""
+    sev_txt = str(parsed.get("Severity of Harm", "Moderate")).strip().lower()
+    severity = _SEVERITY_MAP.get(sev_txt, 3)
     p0 = parsed.get("P0", "Medium")
     p1 = parsed.get("P1", "Medium")
-    poh_matrix = {
+    # quick PoH matrix
+    poh_table = {
         ("Very Low","Very Low"):"Very Low", ("Very Low","Low"):"Very Low",
         ("Very Low","Medium"):"Low", ("Low","Very Low"):"Very Low",
         ("Low","Low"):"Low", ("Low","Medium"):"Medium", ("Medium","Medium"):"Medium",
         ("Medium","High"):"High", ("High","Medium"):"High", ("High","High"):"High",
         ("Very High","High"):"Very High", ("Very High","Very High"):"Very High",
     }
-    poh = poh_matrix.get((p0, p1), "Medium")
+    poh = poh_table.get((p0, p1), "Medium")
     if severity == 5 and poh in ("High", "Very High"):
         risk_index = "Extreme"
     elif severity >= 3 and poh in ("High", "Very High"):
@@ -121,80 +94,42 @@ def _calculate_risk_fields(parsed: Dict[str, Any]):
         risk_index = "Medium"
     return severity, p0, p1, poh, risk_index
 
-# ----------------- tokenizer & model loaders -----------------------
-def _load_tokenizer():
-    from transformers import AutoTokenizer
-    sources = [HA_MODEL_DIR]
-    if BASE_MODEL_ID:
-        sources.append(BASE_MODEL_ID)
-    last = None
-    for src in sources:
-        try:
-            return AutoTokenizer.from_pretrained(src, use_fast=True, **_token_cache_kwargs())
-        except Exception as e:
-            last = e
-            try:
-                return AutoTokenizer.from_pretrained(src, use_fast=False, **_token_cache_kwargs())
-            except Exception as e2:
-                last = e2
-                continue
-    raise RuntimeError(f"Tokenizer load failed. Tried {sources}. Last error: {last}")
-
+# ================== Model loading ==================
 def _load_model():
-    global _tokenizer, _model, _emb, _DEVICE
+    """Load merged model + tokenizer only from HA_MODEL_DIR (no base)."""
+    global _tokenizer, _model, _emb
     if not USE_HA_MODEL or _model is not None:
         return
-    from transformers import AutoModelForCausalLM
+
+    from transformers import AutoTokenizer, AutoModelForCausalLM
     import torch
 
-    _tokenizer = _load_tokenizer()
-    if _tokenizer.pad_token is None:
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
+    src = HA_MODEL_DIR  # merged repo; includes tokenizer
+    _tokenizer = AutoTokenizer.from_pretrained(src, **_token_cache_kwargs())  # type: ignore
+    if getattr(_tokenizer, "pad_token", None) is None:
         _tokenizer.pad_token = _tokenizer.eos_token
 
-    want_cuda = torch.cuda.is_available() and (not FORCE_CPU)
-    try:
-        if want_cuda:
-            _DEVICE = "cuda"
-            _model = AutoModelForCausalLM.from_pretrained(
-                HA_MODEL_DIR,
-                torch_dtype=torch.float16,
-                device_map="auto",
-                low_cpu_mem_usage=True,
-                **_token_cache_kwargs()
-            )
-        else:
-            raise RuntimeError("CPU path")
-    except Exception:
-        try:
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
-        except Exception:
-            pass
-        gc.collect()
-        _DEVICE = "cpu"
-        _model = AutoModelForCausalLM.from_pretrained(
-            HA_MODEL_DIR,
-            torch_dtype=None,
-            low_cpu_mem_usage=True,
-            **_token_cache_kwargs()
-        )
-        _model.to("cpu")
+    _model = AutoModelForCausalLM.from_pretrained(src, torch_dtype=dtype, **_token_cache_kwargs())  # type: ignore
 
+    # Safety: ensure embedding size matches tokenizer
+    if _model.get_input_embeddings().weight.size(0) != len(_tokenizer):
+        _model.resize_token_embeddings(len(_tokenizer))
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    _model.to(device)
+
+    # light retrieval model (nearest requirement)
     if _HAS_EMB:
         try:
             _emb = SentenceTransformer("all-MiniLM-L6-v2", cache_folder=CACHE_DIR)  # type: ignore
         except Exception:
             _emb = None
 
-# ---------- generation (chat template when available) ----------
-def _build_prompt_text(risk: str) -> str:
-    sys = (
-        "You are a compliance engineer for medical devices. "
-        "Return ONLY a single strict JSON object for the given risk."
-    )
-    usr = f"""
-Risk: {risk}
-
-JSON schema:
+# ================== Prompt ==================
+_PROMPT = """You are performing Hazard Analysis for an infusion pump.
+Return ONLY a single valid JSON object with these keys:
 {{
   "Hazard": "...",
   "Hazardous Situation": "...",
@@ -204,36 +139,36 @@ JSON schema:
   "P0": "Very Low|Low|Medium|High|Very High",
   "P1": "Very Low|Low|Medium|High|Very High"
 }}
-Rules:
-- Output only JSON. No prose, no markdown.
-- Fill all fields with concise, domain-appropriate phrases.
-"""
-    try:
-        chat = [{"role":"system","content":sys},{"role":"user","content":usr}]
-        return _tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)  # type: ignore
-    except Exception:
-        return sys + "\n\n" + usr
 
-def _gen_json_for_risk(risk: str) -> Dict[str, Any]:
+Risk to Health: {risk}
+Make outputs concise and specific to infusion pump context.
+"""
+
+def _generate_for_risk(risk: str) -> Dict[str, Any]:
+    """LLM call -> JSON parse; mirrors your Colab flow minus LangChain plumbing."""
     _load_model()
     import torch
-    prompt_text = _build_prompt_text(risk)
-    inputs = _tokenizer(prompt_text, return_tensors="pt").to(_DEVICE)  # type: ignore
+    device = next(_model.parameters()).device  # type: ignore
+
+    prompt = _PROMPT.format(risk=risk)
+    inputs = _tokenizer(prompt, return_tensors="pt").to(device)  # type: ignore
     with torch.no_grad():
         out = _model.generate(
             **inputs,
-            max_new_tokens=256,
+            max_new_tokens=320,
             temperature=0.3,
             do_sample=True,
-            top_p=0.9,
-            eos_token_id=_tokenizer.eos_token_id,
+            top_p=0.9
         )  # type: ignore
-    decoded = _tokenizer.decode(out[0], skip_special_tokens=True)  # type: ignore
-    if GEN_DEBUG:
-        print("=== RAW HA ===", decoded[:1000])
-    return _extract_json(decoded) or {}
+    text = _tokenizer.decode(out[0], skip_special_tokens=True)  # type: ignore
+    return _extract_json(text) or {}
 
-def _nearest_req_control(reqs: List[Dict[str, Any]], hint_text: str) -> str:
+# ================== Retrieval for Risk Control ==================
+def _nearest_requirement_control(reqs: List[Dict[str, Any]], hint: str) -> str:
+    """
+    Use FAISS over the provided product requirements (Requirements text) to pick
+    the best risk control, mirroring your FAISS usage.
+    """
     if not _HAS_EMB or not _emb:
         return "Refer to IEC 60601 and ISO 14971 risk controls"
     try:
@@ -244,19 +179,20 @@ def _nearest_req_control(reqs: List[Dict[str, Any]], hint_text: str) -> str:
         vecs = _emb.encode(corpus, convert_to_numpy=True)  # type: ignore
         index = faiss.IndexFlatL2(vecs.shape[1])
         index.add(vecs)
-        q = _emb.encode([hint_text or "risk control"], convert_to_numpy=True)  # type: ignore
+        q = _emb.encode([hint or "risk control"], convert_to_numpy=True)  # type: ignore
         D, I = index.search(q, 1)
         i = int(I[0][0])
         return f"{corpus[i]} (Ref: {ids[i]})" if 0 <= i < len(corpus) else "Refer to IEC 60601 and ISO 14971 risk controls"
     except Exception:
         return "Refer to IEC 60601 and ISO 14971 risk controls"
 
-# ----------------- public API --------------------------------------
+# ================== Public API ==================
 def _fallback_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Used when USE_HA_MODEL=0; produces structured rows with sane defaults."""
     rows = []
     for r in requirements:
         rid = r.get("Requirement ID") or ""
-        for risk in _default_risks:
+        for risk in _DEFAULT_RISKS:
             rows.append({
                 "requirement_id": rid,
                 "risk_id": f"HA-{abs(hash(risk + rid)) % 10_000:04}",
@@ -266,26 +202,42 @@ def _fallback_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "harm": "TBD",
                 "sequence_of_events": "TBD",
                 "severity_of_harm": "3",
-                "p0": "Medium", "p1": "Medium", "poh": "Medium", "risk_index": "Medium",
+                "p0": "Medium",
+                "p1": "Medium",
+                "poh": "Medium",
+                "risk_index": "Medium",
                 "risk_control": f"Refer to IEC 60601 / ISO 14971 (nearest req: {rid})" if rid else "Refer to IEC 60601 / ISO 14971",
             })
     return rows
 
 def ha_predict(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Replicates your Colab HA:
+    - Generate JSON per Risk to Health using your merged model
+    - Apply guardrails to compute Severity/P0/P1/PoH/Risk Index
+    - Retrieve nearest requirement as Risk Control (FAISS)
+    """
     if not USE_HA_MODEL:
         return _fallback_ha(requirements)
+
     out: List[Dict[str, Any]] = []
     for r in requirements:
-        rid   = r.get("Requirement ID") or ""
-        rtext = r.get("Requirements") or ""
-        for risk in _default_risks:
+        rid   = str(r.get("Requirement ID") or "")
+        rtext = str(r.get("Requirements") or "")
+
+        for risk in _DEFAULT_RISKS:
             try:
-                parsed = _gen_json_for_risk(risk)
+                parsed = _generate_for_risk(risk)
             except Exception:
                 parsed = {}
+
+            # Guardrail calc
             severity, p0, p1, poh, risk_index = _calculate_risk_fields(parsed)
+
+            # Retrieval for risk control (requirements vector store)
             hint = (parsed.get("Hazardous Situation", "") + " " + parsed.get("Harm", "")).strip() or rtext
-            control = _nearest_req_control(requirements, hint)
+            control = _nearest_requirement_control(requirements, hint)
+
             out.append({
                 "requirement_id": rid,
                 "risk_id": f"HA-{abs(hash(risk + rid)) % 10_000:04}",
@@ -295,24 +247,20 @@ def ha_predict(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "harm": parsed.get("Harm", "TBD"),
                 "sequence_of_events": parsed.get("Sequence of Events", "TBD"),
                 "severity_of_harm": str(severity),
-                "p0": p0, "p1": p1, "poh": poh, "risk_index": risk_index,
+                "p0": p0,
+                "p1": p1,
+                "poh": poh,
+                "risk_index": risk_index,
                 "risk_control": control,
             })
+
     return out
 
-# ---------- debug/status ----------
-def get_status():
+def debug_status():
     return {
         "use_model": USE_HA_MODEL,
-        "dir_or_repo": HA_MODEL_DIR,
-        "base_tokenizer": BASE_MODEL_ID or "(none)",
-        "device": _DEVICE,
+        "src": HA_MODEL_DIR,
+        "cache": CACHE_DIR,
         "loaded": _model is not None,
+        "device": (str(next(_model.parameters()).device) if _model is not None else None)
     }
-
-def debug_one_sample():
-    try:
-        js = _gen_json_for_risk("Air Embolism")
-        return {"sample_risk": "Air Embolism", "parsed": js}
-    except Exception as e:
-        return {"sample_risk": "Air Embolism", "error": str(e)}
