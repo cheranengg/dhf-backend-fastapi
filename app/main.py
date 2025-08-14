@@ -1,3 +1,33 @@
+# ===== Startup / cache hygiene (load me first) =====
+import os, sys
+
+# Ensure Python can import modules that sit next to this file
+APP_DIR = os.path.dirname(__file__)
+if APP_DIR and APP_DIR not in sys.path:
+    sys.path.insert(0, APP_DIR)
+
+# Pick a writable HF cache (defaults to /tmp/hf on Spaces)
+_cache = (
+    os.environ.get("HF_HOME")
+    or os.environ.get("HF_HUB_CACHE")
+    or os.environ.get("HUGGINGFACE_HUB_CACHE")
+    or os.environ.get("TRANSFORMERS_CACHE")
+    or "/tmp/hf"
+)
+for k in ("HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE"):
+    os.environ.setdefault(k, _cache)
+os.makedirs(_cache, exist_ok=True)
+
+# Import the cleanup hook (executes on import)
+try:
+    import startup_cleanup  # if startup_cleanup.py is next to main.py
+except ModuleNotFoundError:
+    try:
+        from models import startup_cleanup  # if you placed it in app/models/
+    except ModuleNotFoundError:
+        print("[startup] startup_cleanup.py not found; continuing without cache purge.")
+# ===== End startup header =====
+
 from __future__ import annotations
 
 # ---------- HF cache bootstrap (safe defaults) ----------
@@ -18,7 +48,6 @@ os.environ.setdefault("TRANSFORMERS_CACHE", _cache)
 os.makedirs(_cache, exist_ok=True)
 
 # ---------- FastAPI app ----------
-from models import startup_cleanup
 import traceback
 from typing import Any, Dict, List
 from fastapi import FastAPI, Depends, HTTPException, Request, status
