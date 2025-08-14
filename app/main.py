@@ -1,11 +1,23 @@
 from __future__ import annotations
 
-# ---------- bootstrap cache + disable hf_transfer early ----------
+# ---------- HF cache bootstrap (safe defaults) ----------
 import os
-from app.utils.cache_bootstrap import pick_hf_cache_dir
-CACHE_DIR = pick_hf_cache_dir()
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"  # ensure no hf_transfer required
-os.environ.setdefault("OMP_NUM_THREADS", "1")  # quiet libgomp warning
+
+# Respect anything you set in Space "Variables". If nothing is set,
+# use /workspace/.cache/hf which is writable in HF Spaces.
+_cache = (
+    os.environ.get("HF_HOME")
+    or os.environ.get("HF_HUB_CACHE")
+    or os.environ.get("HUGGINGFACE_HUB_CACHE")
+    or os.environ.get("TRANSFORMERS_CACHE")
+    or "/workspace/.cache/hf"
+)
+os.environ.setdefault("HF_HOME", _cache)
+os.environ.setdefault("HF_HUB_CACHE", _cache)
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", _cache)
+os.environ.setdefault("TRANSFORMERS_CACHE", _cache)
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")  # disable hf_transfer requirement
+os.makedirs(_cache, exist_ok=True)
 
 # ---------- FastAPI app ----------
 import traceback
@@ -35,16 +47,12 @@ def require_auth(request: Request):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid token")
 
 # -------- App --------
-app = FastAPI(title="DHF Backend (HA/DVP/TM)", version="1.0.0")
+app = FastAPI(title="DHF Backend (HA/DVP/TM)", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
-
-@app.get("/")
-def root():
-    return {"ok": True, "service": "dhf-backend-fastapi-space", "cache_dir": CACHE_DIR}
 
 # -------- Helpers --------
 def _reqs_to_dicts(reqs: List[RequirementInput]) -> List[Dict[str, Any]]:
@@ -103,7 +111,7 @@ def _normalize_tm_row_api(r: Dict[str, Any]) -> Dict[str, Any]:
 # -------- Routes --------
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "service": "dhf-backend-fastapi-space", "cache_dir": _cache}
 
 @app.get("/debug/flags", dependencies=[Depends(require_auth)])
 def debug_flags():
@@ -119,6 +127,23 @@ def debug_flags():
         "HF_HUB_ENABLE_HF_TRANSFER": os.getenv("HF_HUB_ENABLE_HF_TRANSFER", ""),
         "OMP_NUM_THREADS": os.getenv("OMP_NUM_THREADS", ""),
     }
+
+@app.get("/debug/models", dependencies=[Depends(require_auth)])
+def debug_models():
+    try:
+        ha = getattr(ha_infer, "get_status", lambda: {"loaded": False})()
+        dvp = getattr(dvp_infer, "get_status", lambda: {"loaded": False})()
+        tm  = getattr(tm_infer,  "get_status", lambda: {"loaded": False})()
+        return {"ok": True, "ha": ha, "dvp": dvp, "tm": tm}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/debug/ha_raw", dependencies=[Depends(require_auth)])
+def debug_ha_raw():
+    try:
+        return {"ok": True, **ha_infer.debug_one_sample()}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "trace": traceback.format_exc()}
 
 @app.post("/debug/smoke", dependencies=[Depends(require_auth)])
 def debug_smoke():
@@ -167,7 +192,6 @@ def dvp(payload: Dict[str, Any]):
                 verification_method=row["verification_method"],
                 sample_size=int(row["sample_size"]) if row.get("sample_size", "").isdigit() else None,
                 acceptance_criteria=row["acceptance_criteria"],
-                test_procedure=row["test_procedure"],
             ) for row in dvp_rows_norm]
         }
     except HTTPException:
