@@ -73,10 +73,26 @@ def _calculate_risk_fields(parsed: Dict[str, Any]):
 
 def _load_tokenizer():
     from transformers import AutoTokenizer
-    try:
-        return AutoTokenizer.from_pretrained(BASE_MODEL_ID, use_fast=True, **_token_cache_kwargs())
-    except Exception:
-        return AutoTokenizer.from_pretrained(BASE_MODEL_ID, use_fast=False, **_token_cache_kwargs())
+    # Try the merged repo first (self-contained), then BASE_MODEL_ID (if set)
+    sources = [HA_MODEL_DIR]
+    if BASE_MODEL_ID:
+        sources.append(BASE_MODEL_ID)
+
+    last_err = None
+    for src in sources:
+        try:
+            # try fast tokenizer first
+            return AutoTokenizer.from_pretrained(src, use_fast=True, **_token_cache_kwargs())
+        except Exception as e:
+            last_err = e
+            try:
+                # fall back to non-fast (SentencePiece) tokenizer
+                return AutoTokenizer.from_pretrained(src, use_fast=False, **_token_cache_kwargs())
+            except Exception as e2:
+                last_err = e2
+                continue
+    # If we get here, nothing worked.
+    raise RuntimeError(f"Tokenizer load failed. Tried: {sources}. Last error: {last_err}")
 
 def _load_model():
     global _tokenizer, _model, _emb, _DEVICE
