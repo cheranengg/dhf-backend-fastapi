@@ -100,42 +100,62 @@ def _calculate_risk_fields(parsed: Dict[str, Any]):
     return severity, p0, p1, poh, risk_index
 
 # ----------------- model loading (merged-only) -----------------
+def _load_tokenizer():
+    """Load a safe (slow) tokenizer. Prefer merged repo; fall back to base."""
+    from transformers import AutoTokenizer
+    sources = []
+    if HA_MODEL_DIR:
+        sources.append(HA_MODEL_DIR)
+    if BASE_MODEL_ID:
+        sources.append(BASE_MODEL_ID)
+
+    last_err = None
+    for src in sources:
+        try:
+            # IMPORTANT: use_fast=False avoids the Rust tokenizer JSON parse
+            tok = AutoTokenizer.from_pretrained(src, use_fast=False, **_token_cache_kwargs())
+            if tok.pad_token is None and getattr(tok, "eos_token", None):
+                tok.pad_token = tok.eos_token
+            return tok
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"Tokenizer load failed. Tried: {sources}. Last error: {last_err}")
+
+
 def _load_model():
+    """
+    Load HA model lazily. Use tokenizer from merged repo if possible,
+    otherwise from base. Model weights come from merged repo (or base if unset).
+    """
     global _tokenizer, _model, _emb
-    if not USE_HA_MODEL:
+    if not USE_HA_MODEL or _model is not None:
         return
-    if _model is not None:
-        return
-    if not HA_MODEL_DIR:
-        raise RuntimeError("HA_MODEL_MERGED_DIR is not set.")
 
-    try:
-        from transformers import AutoTokenizer, AutoModelForCausalLM
-        import torch
+    import torch
+    from transformers import AutoModelForCausalLM
 
-        if torch.cuda.is_available():
-            dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-        else:
-            dtype = torch.float32
+    # device & dtype
+    device = "cuda" if torch.cuda.is_available() and os.getenv("FORCE_CPU", "0") != "1" else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
 
-        _tokenizer = AutoTokenizer.from_pretrained(
-            HA_MODEL_DIR, use_fast=True, **_token_cache_kwargs()
-        )
-        if _tokenizer.pad_token is None:
-            _tokenizer.pad_token = _tokenizer.eos_token
+    # 1) tokenizer (slow) with fallback
+    _tokenizer = _load_tokenizer()  # safe loader above
 
-        _model = AutoModelForCausalLM.from_pretrained(
-            HA_MODEL_DIR, torch_dtype=dtype, **_token_cache_kwargs()
-        )
-        _model.to("cuda" if torch.cuda.is_available() else "cpu")
+    # 2) model weights (prefer merged)
+    src = HA_MODEL_DIR or BASE_MODEL_ID
+    if not src:
+        raise RuntimeError("HA model load failed: no HA_MODEL_DIR or BASE_MODEL_ID set")
 
-        if _HAS_EMB:
-            try:
-                _emb = SentenceTransformer("all-MiniLM-L6-v2", cache_folder=CACHE_DIR)  # type: ignore
-            except Exception:
-                _emb = None
-    except Exception as e:
-        raise RuntimeError(f"HA model load failed: {e}")
+    _model = AutoModelForCausalLM.from_pretrained(src, torch_dtype=dtype, **_token_cache_kwargs())
+    _model.to(device)
+
+    # optional: embeddings best-effort
+    if _HAS_EMB:
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+            _emb = SentenceTransformer("all-MiniLM-L6-v2", cache_folder=CACHE_DIR)  # type: ignore
+        except Exception:
+            _emb = None
 
 # ----------------- prompting -----------------
 _PROMPT = """You are generating a Hazard Analysis row for an infusion pump.
