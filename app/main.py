@@ -1,230 +1,365 @@
-# ===== Startup / cache hygiene (load me first) =====
-import os, sys
-
-# Ensure Python can import modules that sit next to this file
-APP_DIR = os.path.dirname(__file__)
-if APP_DIR and APP_DIR not in sys.path:
-    sys.path.insert(0, APP_DIR)
-
-# Pick a writable HF cache (defaults to /tmp/hf on Spaces)
-_cache = (
-    os.environ.get("HF_HOME")
-    or os.environ.get("HF_HUB_CACHE")
-    or os.environ.get("HUGGINGFACE_HUB_CACHE")
-    or os.environ.get("TRANSFORMERS_CACHE")
-    or "/tmp/hf"
-)
-for k in ("HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE"):
-    os.environ.setdefault(k, _cache)
-os.makedirs(_cache, exist_ok=True)
-
-# Import the cleanup hook (executes on import)
-try:
-    import startup_cleanup  # if startup_cleanup.py is next to main.py
-except ModuleNotFoundError:
-    try:
-        from models import startup_cleanup  # if you placed it in app/models/
-    except ModuleNotFoundError:
-        print("[startup] startup_cleanup.py not found; continuing without cache purge.")
-# ===== End startup header =====
-
+# app/main.py
 from __future__ import annotations
 
-# ---------- HF cache bootstrap (safe defaults) ----------
 import os
-
-# Use a writable cache dir in Spaces
-_cache = (
-    os.environ.get("HF_HOME")
-    or os.environ.get("HF_HUB_CACHE")
-    or os.environ.get("HUGGINGFACE_HUB_CACHE")
-    or os.environ.get("TRANSFORMERS_CACHE")
-    or "/tmp/hf"
-)
-os.environ.setdefault("HF_HOME", _cache)
-os.environ.setdefault("HF_HUB_CACHE", _cache)
-os.environ.setdefault("HUGGINGFACE_HUB_CACHE", _cache)
-os.environ.setdefault("TRANSFORMERS_CACHE", _cache)
-os.makedirs(_cache, exist_ok=True)
-
-# ---------- FastAPI app ----------
 import traceback
-from typing import Any, Dict, List
-from fastapi import FastAPI, Depends, HTTPException, Request, status
+from typing import Any, Dict, List, Optional
+
+from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.utils.io_schemas import (
-    RequirementInput, HazardAnalysisRow, HazardAnalysisOutput,
-    DvpRow, DvpOutput, TraceMatrixRow, TraceMatrixOutput
-)
-from app.utils.guardrails import (
-    DEFAULT_ALLOWED_METHODS, sanitize_text, ensure_tbd,
-    normalize_tm_row, guard_tm_rows
-)
-from app.models import ha_infer, dvp_infer, tm_infer
+# Optional startup hook (no-op if file not present)
+try:
+    import startup_cleanup  # noqa: F401
+except Exception:
+    pass
 
-# -------- Security --------
-BACKEND_TOKEN = os.getenv("BACKEND_TOKEN", "dev-token")
+# -------------------------------------------------------------------
+# Feature flags & limits
+# -------------------------------------------------------------------
+ENABLE_DVP   = os.getenv("ENABLE_DVP", "1") == "1"
+ENABLE_TM    = os.getenv("ENABLE_TM",  "0") == "1"   # start disabled until ready
+MAX_REQS     = int(os.getenv("MAX_REQS", "10"))
+QUICK_LIMIT  = int(os.getenv("QUICK_LIMIT", "0"))    # 0 = off; >0 caps rows for quick tests
+BACKEND_TOKEN = os.getenv("BACKEND_TOKEN", "devtoken")
 
-def require_auth(request: Request):
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
-    token = auth.split(" ", 1)[1].strip()
-    if token != BACKEND_TOKEN:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid token")
+# -------------------------------------------------------------------
+# Model modules (import DVP/TM defensively)
+# -------------------------------------------------------------------
+from app.models import ha_infer  # uses infer_ha()
 
-# -------- App --------
-app = FastAPI(title="DHF Backend (HA/DVP/TM)", version="1.0.0")
+_dvp_available = False
+try:
+    from app.models import dvp_infer  # type: ignore
+    _dvp_available = True
+except Exception:
+    _dvp_available = False
+
+_tm_available = False
+try:
+    from app.models import tm_infer  # type: ignore
+    _tm_available = True
+except Exception:
+    _tm_available = False
+
+# -------------------------------------------------------------------
+# FastAPI setup
+# -------------------------------------------------------------------
+app = FastAPI(title="DHF Backend")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],  # lock down for prod
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# -------- Helpers --------
-def _reqs_to_dicts(reqs: List[RequirementInput]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for r in reqs:
-        out.append({
-            "Requirement ID": sanitize_text(r.requirement_id or ""),
-            "Verification ID": "",
-            "Requirements": sanitize_text(r.requirements),
-        })
-    return out
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
+def _auth(authorization: Optional[str]) -> None:
+    """Simple bearer-token auth shared by all endpoints."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing token")
+    token = authorization.split(" ", 1)[1].strip()
+    if token != BACKEND_TOKEN:
+        raise HTTPException(status_code=403, detail="Bad token")
 
-def _normalize_ha_row(r: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "requirement_id": sanitize_text(r.get("requirement_id") or r.get("Requirement ID") or ""),
-        "risk_id": ensure_tbd(r.get("risk_id") or r.get("Risk ID")),
-        "hazard": ensure_tbd(r.get("hazard") or r.get("Hazard")),
-        "hazardous_situation": ensure_tbd(r.get("hazardous_situation") or r.get("Hazardous situation") or r.get("Hazardous Situation")),
-        "risk_to_health": ensure_tbd(r.get("risk_to_health") or r.get("Risk to Health")),
-        "harm": ensure_tbd(r.get("harm") or r.get("Harm")),
-        "sequence_of_events": ensure_tbd(r.get("sequence_of_events") or r.get("Sequence of Events")),
-        "severity_of_harm": ensure_tbd(r.get("severity_of_harm") or r.get("Severity of Harm")),
-        "p0": ensure_tbd(r.get("p0") or r.get("P0")),
-        "p1": ensure_tbd(r.get("p1") or r.get("P1")),
-        "poh": ensure_tbd(r.get("poh") or r.get("PoH")),
-        "risk_index": ensure_tbd(r.get("risk_index") or r.get("Risk Index")),
-        "risk_control": ensure_tbd(r.get("risk_control") or r.get("Risk Control") or r.get("HA Risk Control")),
-    }
 
-def _normalize_dvp_row(r: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "verification_id": sanitize_text(r.get("verification_id") or r.get("Verification ID") or ""),
-        "requirement_id": sanitize_text(r.get("requirement_id") or r.get("Requirement ID") or ""),
-        "requirements": ensure_tbd(r.get("requirements") or r.get("Requirements")),
-        "verification_method": ensure_tbd(r.get("verification_method") or r.get("Verification Method")),
-        "sample_size": sanitize_text(r.get("sample_size") or r.get("Sample Size") or ""),
-        "acceptance_criteria": ensure_tbd(r.get("acceptance_criteria") or r.get("Acceptance Criteria")),
-        "test_procedure": ensure_tbd(r.get("test_procedure") or r.get("Test Procedure")),
-    }
+def _limit_requirements(
+    reqs: List[Dict[str, Any]],
+    n: Optional[int] = None
+) -> List[Dict[str, Any]]:
+    """
+    Cap the number of requirement rows we *process* to speed up test runs.
+    Precedence: per-call n > QUICK_LIMIT > MAX_REQS.
+    """
+    if not isinstance(reqs, list):
+        return []
+    hard = n or QUICK_LIMIT or MAX_REQS
+    if hard and len(reqs) > hard:
+        return reqs[:hard]
+    return reqs
 
-def _normalize_tm_row_api(r: Dict[str, Any]) -> Dict[str, Any]:
-    base = normalize_tm_row({
-        "verification_id": r.get("verification_id") or r.get("Verification ID"),
-        "requirement_id": r.get("requirement_id") or r.get("Requirement ID"),
-        "requirements": r.get("requirements") or r.get("Requirements"),
-        "risk_ids": r.get("risk_ids") or r.get("Risk ID(s)") or r.get("risk_id"),
-        "risks_to_health": r.get("risks_to_health") or r.get("Risk to Health"),
-        "ha_risk_controls": r.get("ha_risk_controls") or r.get("HA Risk Control(s)") or r.get("risk_control"),
-        "verification_method": r.get("verification_method") or r.get("Verification Method"),
-        "acceptance_criteria": r.get("acceptance_criteria") or r.get("Acceptance Criteria"),
-    })
-    base["risk_ids"] = base["risk_ids"].replace(" ,", ",").replace(", ,", ",").strip()
-    base["ha_risk_controls"] = base["ha_risk_controls"].replace(" ,", ",").replace(", ,", ",").strip()
-    return base
 
-# -------- Routes --------
+def _cap_rows(rows: List[Dict[str, Any]], n: Optional[int]) -> List[Dict[str, Any]]:
+    """Cap the number of rows we *return* for quick previews."""
+    if not isinstance(rows, list):
+        return []
+    if n and len(rows) > n:
+        return rows[:n]
+    if QUICK_LIMIT and len(rows) > QUICK_LIMIT:
+        return rows[:QUICK_LIMIT]
+    return rows
+
+
+# -------------------------------------------------------------------
+# Endpoints
+# -------------------------------------------------------------------
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "dhf-backend-fastapi-space", "cache_dir": _cache}
-
-@app.get("/debug/flags", dependencies=[Depends(require_auth)])
-def debug_flags():
     return {
-        "USE_HA_MODEL": os.getenv("USE_HA_MODEL", "0"),
-        "USE_DVP_MODEL": os.getenv("USE_DVP_MODEL", "0"),
-        "USE_TM_MODEL": os.getenv("USE_TM_MODEL", "0"),
-        "HA_MODEL_MERGED_DIR": os.getenv("HA_MODEL_MERGED_DIR", os.getenv("HA_MODEL_DIR", "")),
-        "DVP_MODEL_DIR": os.getenv("DVP_MODEL_DIR", ""),
-        "TM_MODEL_DIR": os.getenv("TM_MODEL_DIR", ""),
-        "BASE_MODEL_ID": os.getenv("BASE_MODEL_ID", ""),  # visible, can be blank
-        "HF_HOME": os.getenv("HF_HOME", ""),
-        "HF_HUB_ENABLE_HF_TRANSFER": os.getenv("HF_HUB_ENABLE_HF_TRANSFER", "0"),
-        "OMP_NUM_THREADS": os.getenv("OMP_NUM_THREADS", ""),
+        "ok": True,
+        "enable_dvp": ENABLE_DVP and _dvp_available,
+        "enable_tm": ENABLE_TM and _tm_available,
+        "tm_available": _tm_available,
+        "max_reqs": MAX_REQS,
+        "quick_limit": QUICK_LIMIT,
     }
 
-@app.post("/debug/smoke", dependencies=[Depends(require_auth)])
-def debug_smoke():
-    try:
-        reqs = [
-            {"Requirement ID": "REQ-001", "Verification ID": "VER-001", "Requirements": "Detect air-in-line within 1 second"},
-            {"Requirement ID": "REQ-002", "Verification ID": "VER-002", "Requirements": "Stop infusion on occlusion"},
-        ]
-        ha_rows = ha_infer.ha_predict(reqs)
-        dvp_rows = dvp_infer.dvp_predict(reqs, ha_rows)
-        tm_rows  = tm_infer.tm_predict(reqs, ha_rows, dvp_rows)
-        return {"ok": True, "sizes": {"ha": len(ha_rows), "dvp": len(dvp_rows), "tm": len(tm_rows)}}
-    except Exception as e:
-        return {"ok": False, "error": str(e), "trace": traceback.format_exc()}
 
-@app.post("/hazard-analysis", response_model=HazardAnalysisOutput, dependencies=[Depends(require_auth)])
-def hazard_analysis(payload: Dict[str, Any]):
-    try:
-        raw_reqs = payload.get("requirements", [])
-        if not isinstance(raw_reqs, list) or not raw_reqs:
-            raise HTTPException(400, "`requirements` must be a non-empty list")
-        reqs_dict = raw_reqs if "Requirements" in (raw_reqs[0] or {}) else _reqs_to_dicts(raw_reqs)
-        ha_rows_raw: List[Dict[str, Any]] = ha_infer.ha_predict(reqs_dict)
-        ha_rows_norm = [_normalize_ha_row(r) for r in ha_rows_raw]
-        return {"ha": [HazardAnalysisRow(**row) for row in ha_rows_norm]}  # type: ignore
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, f"HA failed: {e}")
+@app.get("/debug/ha_status")
+def debug_ha_status():
+    """Adapter-only status + RAG + MAUDE visibility for HA service."""
+    rag_rows = len(getattr(ha_infer, "_RAG_DB", []) or [])
+    return {
+        "adapter_enabled": bool(os.getenv("USE_HA_ADAPTER", "1") == "1"),
+        "adapter_repo": os.getenv("HA_ADAPTER_REPO", "cheranengg/dhf-ha-adapter"),
+        "base_model": os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2"),
+        "rag_path": os.getenv("HA_RAG_PATH", "app/rag_sources/ha_synthetic.jsonl"),
+        "rag_rows_loaded": rag_rows,
+        # MAUDE internet enrichment
+        "maude_fetch": os.getenv("MAUDE_FETCH", "0") == "1",
+        "maude_device": os.getenv("MAUDE_DEVICE", "SIGMA SPECTRUM"),
+        "maude_limit": int(os.getenv("MAUDE_LIMIT", "20")),
+        "maude_ttl": int(os.getenv("MAUDE_TTL", "86400")),
+        "quick_limit": QUICK_LIMIT,
+    }
 
-@app.post("/dvp", response_model=DvpOutput, dependencies=[Depends(require_auth)])
-def dvp(payload: Dict[str, Any]):
-    try:
-        raw_reqs = payload.get("requirements", [])
-        ha_rows = payload.get("ha", [])
-        if not isinstance(raw_reqs, list) or not raw_reqs:
-            raise HTTPException(400, "`requirements` must be a non-empty list")
-        reqs_dict = raw_reqs if "Requirements" in (raw_reqs[0] or {}) else _reqs_to_dicts(raw_reqs)
-        dvp_rows_raw: List[Dict[str, Any]] = dvp_infer.dvp_predict(reqs_dict, ha_rows)
-        dvp_rows_norm = [_normalize_dvp_row(r) for r in dvp_rows_raw]
-        return {
-            "dvp": [DvpRow(
-                verification_id=row["verification_id"],
-                requirement_id=row.get("requirement_id"),
-                requirements=row.get("requirements"),
-                verification_method=row["verification_method"],
-                sample_size=int(row["sample_size"]) if row.get("sample_size", "").isdigit() else None,
-                acceptance_criteria=row["acceptance_criteria"],
-                test_procedure=row.get("test_procedure"),
-            ) for row in dvp_rows_norm]
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, f"DVP failed: {e}")
 
-@app.post("/trace-matrix", response_model=TraceMatrixOutput, dependencies=[Depends(require_auth)])
-def trace_matrix(payload: Dict[str, Any]):
+@app.post("/hazard-analysis")
+def hazard_endpoint(
+    request: Request,
+    payload: Dict[str, Any] = Body(...),
+    authorization: Optional[str] = Header(default=None),
+    debug: int = Query(0, description="Include diagnostics in response"),
+    limit: Optional[int] = Query(default=None, description="Cap rows for quick tests"),
+):
+    """
+    Request body:
+    {
+      "requirements": [
+        {"Requirement ID": "...", "Requirements": "..."},
+        ...
+      ]
+    }
+    """
+    _auth(authorization)
+
+    diag: Dict[str, Any] = {}
     try:
-        raw_reqs = payload.get("requirements", [])
-        ha_rows = payload.get("ha", [])
-        dvp_rows = payload.get("dvp", [])
-        if not isinstance(raw_reqs, list) or not raw_reqs:
-            raise HTTPException(400, "`requirements` must be a non-empty list")
-        reqs_dict = raw_reqs if "Requirements" in (raw_reqs[0] or {}) else _reqs_to_dicts(raw_reqs)
-        tm_rows_raw: List[Dict[str, Any]] = tm_infer.tm_predict(reqs_dict, ha_rows, dvp_rows)
-        tm_rows_norm = [_normalize_tm_row_api(r) for r in tm_rows_raw]
-        _ = guard_tm_rows(tm_rows_norm, allowed_methods=DEFAULT_ALLOWED_METHODS)  # optional
-        return {"trace_matrix": [TraceMatrixRow(**row) for row in tm_rows_norm]}  # type: ignore
-    except HTTPException:
-        raise
+        reqs: List[Dict[str, Any]] = payload.get("requirements") or []
+        reqs = _limit_requirements(reqs, n=limit)
+
+        # === HA inference (adapter + synthetic RAG + MAUDE enrichment) ===
+        ha_rows = ha_infer.infer_ha(reqs)
+        ha_rows = _cap_rows(ha_rows, limit)
+
+        if debug:
+            diag = {
+                "adapter": os.getenv("USE_HA_ADAPTER", "1") == "1",
+                "adapter_repo": os.getenv("HA_ADAPTER_REPO", "cheranengg/dhf-ha-adapter"),
+                "base_model": os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2"),
+                "rag_path": os.getenv("HA_RAG_PATH", "app/rag_sources/ha_synthetic.jsonl"),
+                "rag_rows": len(getattr(ha_infer, "_RAG_DB", []) or []),
+                "maude_fetch": os.getenv("MAUDE_FETCH", "0") == "1",
+                "maude_device": os.getenv("MAUDE_DEVICE", "SIGMA SPECTRUM"),
+                "maude_limit": int(os.getenv("MAUDE_LIMIT", "20")),
+                "maude_ttl": int(os.getenv("MAUDE_TTL", "86400")),
+                "n_rows": len(ha_rows),
+                "quick_limit": QUICK_LIMIT,
+                "limit_param": limit,
+            }
+
+        return {"ok": True, "ha": ha_rows, **({"diag": diag} if debug else {})}
+
     except Exception as e:
-        raise HTTPException(500, f"TM failed: {e}")
+        tb = traceback.format_exc()
+        print({"hazard_endpoint_error": str(e), "traceback": tb})
+        if debug:
+            diag.update({
+                "error": str(e),
+                "traceback": tb,
+            })
+            return {"ok": False, "ha": [], "diag": diag}
+        raise HTTPException(status_code=500, detail=f"HA failed: {e}")
+
+
+@app.post("/dvp")
+def dvp_endpoint(
+    payload: Dict[str, Any] = Body(...),
+    authorization: Optional[str] = Header(default=None),
+    limit: Optional[int] = Query(default=None, description="Cap rows for quick tests"),
+):
+    """
+    Request body:
+    {
+      "requirements": [...],   # shape like hazard-analysis
+      "ha": [...]              # output from hazard-analysis (optional but helpful)
+    }
+    """
+    _auth(authorization)
+    if not (ENABLE_DVP and _dvp_available):
+        raise HTTPException(status_code=503, detail="DVP unavailable.")
+    try:
+        reqs: List[Dict[str, Any]] = payload.get("requirements") or []
+        ha_rows: List[Dict[str, Any]] = payload.get("ha") or []
+
+        reqs    = _limit_requirements(reqs, n=limit)
+        ha_rows = _cap_rows(ha_rows, limit)
+
+        dvp_rows = dvp_infer.dvp_predict(reqs, ha_rows)  # type: ignore
+        dvp_rows = _cap_rows(dvp_rows, limit)
+        return {"ok": True, "dvp": dvp_rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DVP failed: {e}")
+
+
+def _tm_handler(
+    payload: Dict[str, Any],
+    authorization: Optional[str],
+    limit: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Accepts:
+    {
+      "requirements": [...],
+      "ha": [...],
+      "dvp": [...]
+    }
+    Returns: {"ok": true, "tm": [...]}
+    """
+    _auth(authorization)
+    if not (ENABLE_TM and _tm_available):
+        raise HTTPException(status_code=503, detail="TM unavailable.")
+    try:
+        reqs: List[Dict[str, Any]] = payload.get("requirements") or []
+        ha_rows: List[Dict[str, Any]] = payload.get("ha") or []
+        dvp_rows: List[Dict[str, Any]] = payload.get("dvp") or []
+
+        reqs     = _limit_requirements(reqs, n=limit)
+        ha_rows  = _cap_rows(ha_rows, limit)
+        dvp_rows = _cap_rows(dvp_rows, limit)
+
+        if hasattr(tm_infer, "tm_predict"):
+            tm_rows = tm_infer.tm_predict(reqs, ha_rows, dvp_rows)  # type: ignore
+        else:
+            # very light fallback (no model): join key fields so UI doesn’t 404
+            from collections import defaultdict
+
+            def j(values):
+                vals = [str(v).strip() for v in values if str(v).strip() and str(v).strip().upper() != "NA"]
+                seen = []
+                for v in vals:
+                    if v not in seen:
+                        seen.append(v)
+                return ", ".join(seen) if seen else "TBD - Human / SME input"
+
+            ha_by_req = defaultdict(list)
+            for h in ha_rows:
+                rid = str(h.get("requirement_id") or h.get("Requirement ID") or "")
+                if rid:
+                    ha_by_req[rid].append(h)
+
+            dvp_by_vid = {}
+            for d in dvp_rows:
+                vid = str(d.get("verification_id") or d.get("Verification ID") or "")
+                if vid and vid not in dvp_by_vid:
+                    dvp_by_vid[vid] = d
+
+            tm_rows: List[Dict[str, Any]] = []
+            for r in reqs:
+                rid = str(r.get("Requirement ID") or "")
+                vid = str(r.get("Verification ID") or "")
+                rtxt = str(r.get("Requirements") or "")
+
+                ha_slice = ha_by_req.get(rid, [])
+                drow = dvp_by_vid.get(vid, {})
+
+                risk_ids = j([h.get("risk_id") or h.get("Risk ID") or "" for h in ha_slice])
+                risks    = j([h.get("risk_to_health") or h.get("Risk to Health") or "" for h in ha_slice])
+                controls = j([h.get("risk_control") or h.get("HA Risk Control") or "" for h in ha_slice])
+
+                method = drow.get("verification_method") or drow.get("Verification Method") or "TBD - Human / SME input"
+                crit   = drow.get("acceptance_criteria") or drow.get("Acceptance Criteria") or "TBD - Human / SME input"
+
+                tm_rows.append({
+                    "verification_id": vid or "NA",
+                    "requirement_id": rid,
+                    "requirements": rtxt,
+                    "risk_ids": risk_ids,
+                    "risks_to_health": risks,
+                    "ha_risk_controls": controls,
+                    "verification_method": method,
+                    "acceptance_criteria": crit,
+                })
+
+        tm_rows = _cap_rows(tm_rows, limit)
+        return {"ok": True, "tm": tm_rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TM failed: {e}")
+
+
+@app.post("/tm")
+def tm_endpoint(
+    payload: Dict[str, Any] = Body(...),
+    authorization: Optional[str] = Header(default=None),
+    limit: Optional[int] = Query(default=None, description="Cap rows for quick tests"),
+):
+    return _tm_handler(payload, authorization, limit)
+
+
+@app.post("/trace-matrix")
+def trace_matrix_endpoint(
+    payload: Dict[str, Any] = Body(...),
+    authorization: Optional[str] = Header(default=None),
+    limit: Optional[int] = Query(default=None, description="Cap rows for quick tests"),
+):
+    return _tm_handler(payload, authorization, limit)
+
+
+# ------------------------- Debug -----------------------------------
+@app.post("/debug/smoke")
+def debug_smoke(
+    authorization: Optional[str] = Header(default=None),
+    limit: Optional[int] = Query(default=None, description="Cap rows for quick tests"),
+):
+    """
+    Quick smoke test that runs HA (always) and DVP/TM if enabled.
+    """
+    _auth(authorization)
+    reqs = [
+        {"Requirement ID": "REQ-001", "Verification ID": "VER-001",
+         "Requirements": "The pump shall maintain flow accuracy within ±5% from set value."},
+        {"Requirement ID": "REQ-002", "Verification ID": "VER-002",
+         "Requirements": "Labeling shall be legible at 30 cm and use ISO 15223-1 symbols."},
+        {"Requirement ID": "REQ-003", "Verification ID": "VER-003",
+         "Requirements": "Occlusion alarm shall trigger within 30 seconds at 100 kPa back pressure."},
+        {"Requirement ID": "REQ-004", "Verification ID": "VER-004",
+         "Requirements": "Leakage current at rated voltage shall not exceed 100 µA."},
+        {"Requirement ID": "REQ-005", "Verification ID": "VER-005",
+         "Requirements": "User interface shall prevent decimal-point mis-entry during setup."},
+        {"Requirement ID": "REQ-006", "Verification ID": "VER-006",
+         "Requirements": "Materials in patient-contact shall pass ISO 10993-1 cytotoxicity test."},
+    ]
+    reqs = _limit_requirements(reqs, n=limit)
+
+    try:
+        ha_rows = ha_infer.infer_ha(reqs)
+        ha_rows = _cap_rows(ha_rows, limit)
+        out: Dict[str, Any] = {"ok": True, "ha": ha_rows}
+
+        if ENABLE_DVP and _dvp_available:
+            dvp_rows = dvp_infer.dvp_predict(reqs, ha_rows)  # type: ignore
+            out["dvp"] = _cap_rows(dvp_rows, limit)
+
+        if ENABLE_TM and _tm_available:
+            out["tm"] = _cap_rows(
+                _tm_handler({"requirements": reqs, "ha": ha_rows, "dvp": out.get("dvp", [])},
+                            authorization, limit)["tm"],  # type: ignore
+                limit
+            )
+        return out
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
