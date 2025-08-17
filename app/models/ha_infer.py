@@ -1,396 +1,441 @@
 # app/models/ha_infer.py
 from __future__ import annotations
-import os, json, time, random, re, hashlib
-from typing import Any, Dict, List, Tuple
 
-import requests
+import os
+import re
+import gc
+import json
+import random
+from typing import List, Dict, Any, Optional, Tuple
 
-# -----------------------
-# Env & runtime toggles
-# -----------------------
-BASE_MODEL_ID   = os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
-USE_HA_ADAPTER  = os.getenv("USE_HA_ADAPTER", "1") == "1"
-HA_ADAPTER_REPO = os.getenv("HA_ADAPTER_REPO", "cheranengg/dhf-ha-adapter")
+import torch
 
-# RAG (synthetic HA) file
-HA_RAG_PATH     = os.getenv("HA_RAG_PATH", "app/rag_sources/ha_synthetic.jsonl")
+# ---------------------------
+# Environment / toggles
+# ---------------------------
+USE_HA_ADAPTER: bool = os.getenv("USE_HA_ADAPTER", "1") == "1"
+BASE_MODEL_ID: str = os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
+HA_ADAPTER_REPO: str = os.getenv("HA_ADAPTER_REPO", "cheranengg/dhf-ha-adapter")
 
-# MAUDE dialing:
-MAUDE_FETCH     = os.getenv("MAUDE_FETCH", "1") == "1"     # keep ON
-MAUDE_DEVICE    = os.getenv("MAUDE_DEVICE", "SIGMA SPECTRUM")  # **single** device
-MAUDE_LIMIT     = int(os.getenv("MAUDE_LIMIT", "20"))
-MAUDE_TTL       = int(os.getenv("MAUDE_TTL", "86400"))
-# NEW: only use MAUDE for 70% of rows (randomized per request-row)
-MAUDE_SAMPLE_RATE = float(os.getenv("MAUDE_SAMPLE_RATE", "0.7"))
+# RAG: generic JSONL (synthetic HA or MAUDE distilled)
+HA_RAG_PATH: str = os.getenv("HA_RAG_PATH", "app/rag_sources/ha_synthetic.jsonl")
 
-# Quick test limiter (main.py also enforces)
-QUICK_LIMIT     = int(os.getenv("QUICK_LIMIT", "5"))
+# Local MAUDE
+MAUDE_LOCAL_PATH: str = os.getenv("MAUDE_LOCAL_JSONL", "app/rag_sources/maude_sigma_spectrum.jsonl")
+MAUDE_LOCAL_ONLY: bool = os.getenv("MAUDE_LOCAL_ONLY", "1") == "1"
+MAUDE_FRACTION: float = float(os.getenv("MAUDE_FRACTION", "0.70"))
 
-# Optional paraphrasing of exact RAG matches
-PARA_ENABLE     = os.getenv("PARAPHRASE_FROM_RAG", "1") == "1"
-PARA_MAX_WORDS  = int(os.getenv("PARAPHRASE_MAX_WORDS", "24"))
-SIM_THRESHOLD   = float(os.getenv("SIM_THRESHOLD", "0.88"))
+# Generation controls
+HA_MAX_NEW_TOKENS: int = int(os.getenv("HA_MAX_NEW_TOKENS", "192"))
+NUM_BEAMS: int = int(os.getenv("NUM_BEAMS", "1"))
+DO_SAMPLE: bool = os.getenv("do_sample", "1") == "1"
+TOP_P: float = float(os.getenv("HA_TOP_P", "0.90"))
+TEMPERATURE: float = float(os.getenv("HA_TEMPERATURE", "0.35"))
+REPETITION_PENALTY: float = float(os.getenv("HA_REPETITION_PENALTY", "1.05"))
 
-HF_TOKEN = (
-    os.getenv("HF_TOKEN")
-    or os.getenv("HUGGING_FACE_HUB_TOKEN")
-    or os.getenv("HUGGINGFACE_HUB_TOKEN")
-)
+# Safety / speed
+FORCE_CPU: bool = os.getenv("FORCE_CPU", "0") == "1"
+OFFLOAD_DIR: str = os.getenv("OFFLOAD_DIR", "/tmp/offload")
+CACHE_DIR: str = os.getenv("HF_HOME") or os.getenv("TRANSFORMERS_CACHE") or "/tmp/hf"  # fixed
 
-CACHE_DIR       = os.getenv("HF_HOME") or os.getenv("TRANSFORMERS_CACHE") or "/tmp/hf"
-MAUDE_CACHE_DIR = os.getenv("MAUDE_CACHE_DIR", "/tmp/maude_cache")
+# Input length cap
+HA_INPUT_MAX_TOKENS: int = int(os.getenv("HA_INPUT_MAX_TOKENS", "512"))
 
-os.makedirs(MAUDE_CACHE_DIR, exist_ok=True)
+# Paraphrase RAG
+PARAPHRASE_FROM_RAG: bool = os.getenv("PARAPHRASE_FROM_RAG", "1") == "1"
+PARAPHRASE_MAX_WORDS: int = int(os.getenv("PARAPHRASE_MAX_WORDS", "22"))
 
-# ------------------------------------------------
-# Lightweight adapter load (same as earlier build)
-# ------------------------------------------------
+# Cap rows
+ROW_LIMIT: int = int(os.getenv("HA_ROW_LIMIT", "50"))
+
+# Debug
+DEBUG_HA: bool = os.getenv("DEBUG_HA", "1") == "1"
+DEBUG_PEEK_CHARS: int = int(os.getenv("DEBUG_PEEK_CHARS", "320"))
+
+# ---------------------------
+# Globals
+# ---------------------------
 _tokenizer = None
-_model     = None
-
-def _load_model():
-    """Load the base instruct model (+ adapter if present)."""
-    global _tokenizer, _model
-    if _model is not None:
-        return
-
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-    import torch
-
-    kw = {"cache_dir": CACHE_DIR}
-    if HF_TOKEN:
-        kw["token"] = HF_TOKEN
-
-    _tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID, **kw)
-    if _tokenizer.pad_token is None:
-        _tokenizer.pad_token = _tokenizer.eos_token
-
-    _model = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL_ID,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        low_cpu_mem_usage=True,
-        device_map="auto" if torch.cuda.is_available() else None,
-        **kw
-    )
-
-    # Attach PEFT adapter (LoRA) if requested
-    if USE_HA_ADAPTER:
-        try:
-            from peft import PeftModel
-            _model = PeftModel.from_pretrained(_model, HA_ADAPTER_REPO, **kw)
-        except Exception as e:
-            print({"ha_adapter_load_warning": str(e)})
-
-    try:
-        _model.config.pad_token_id = _tokenizer.pad_token_id
-    except Exception:
-        pass
-
-
-# ----------------------
-# RAG: load once
-# ----------------------
+_model = None
 _RAG_DB: List[Dict[str, Any]] = []
+_MAUDE_ROWS: List[Dict[str, Any]] = []
+_logged_model_banner = False
 
-def _load_rag():
-    global _RAG_DB
-    if _RAG_DB:
-        return
-    try:
-        with open(HA_RAG_PATH, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                    _RAG_DB.append(obj)
-                except Exception:
-                    pass
-        print({"ha_rag": "loaded", "path": HA_RAG_PATH, "rows": len(_RAG_DB)})
-    except FileNotFoundError:
-        print({"ha_rag": "missing", "path": HA_RAG_PATH})
-        _RAG_DB = []
+# ---------------------------
+# Controlled vocab
+# ---------------------------
+RISK_TO_HEALTH_CHOICES = [
+    "Air Embolism", "Allergic response", "Delay of therapy", "Environmental Hazard",
+    "Incorrect Therapy", "Infection", "Overdose", "Particulate", "Trauma", "Underdose",
+]
 
+HARM_BY_RTH = {
+    "Air Embolism": ["Pulmonary Embolism", "Stroke", "Shortness of breath", "Severe Injury", "Death"],
+    "Allergic response": ["Allergic reaction (Systemic / Localized)", "Toxic effects", "Severe Injury"],
+    "Delay of therapy": ["Disease Progression", "Severe Injury", "Death"],
+    "Environmental Hazard": ["Toxic effects", "Chemical burns", "Severe Injury"],
+    "Incorrect Therapy": ["Hypertension", "Hypotension", "Cardiac Arrhythmia", "Tachycardia", "Bradycardia", "Seizure", "Organ damage"],
+    "Infection": ["Sepsis", "Cellulitis", "Severe Septic Shock"],
+    "Overdose": ["Organ Failure", "Cardiac Arrhythmia", "Toxic effects"],
+    "Underdose": ["Progression of untreated condition", "Severe Injury"],
+    "Particulate": ["Embolism", "Organ damage", "Severe Injury"],
+    "Trauma": ["Severe Injury", "Organ damage", "Bradycardia"],
+}
 
-# ----------------------
-# MAUDE helpers (70%)
-# ----------------------
-def _cache_path(key: str) -> str:
-    h = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
-    return os.path.join(MAUDE_CACHE_DIR, f"{h}.json")
+# Requirement → (hazard, hazardous_situation, risk_to_health)
+REQ_TO_HA_PATTERNS: List[Tuple[List[str], Tuple[str, str, str]]] = [
+    (["air-in-line", "air in line", "bubble", "air detection"],
+     ("Air-in-line not detected", "Patient receives air", "Air Embolism")),
+    (["occlusion", "blockage", "line occlusion"],
+     ("Line occlusion", "Flow restricted during therapy", "Delay of therapy")),
+    (["flow", "accuracy", "rate"],
+     ("Inaccurate flow rate", "Incorrect volume delivered", "Incorrect Therapy")),
+    (["leakage current", "patient leakage"],
+     ("Electrical leakage", "Patient contacted by leakage current", "Trauma")),
+    (["dielectric", "hi-pot", "hipot"],
+     ("Insulation breakdown", "Breakdown under high potential", "Trauma")),
+    (["insulation resistance", "insulation"],
+     ("Insulation degradation", "Compromised insulation", "Trauma")),
+    (["protective earth", "earth continuity"],
+     ("Protective earth failure", "Accessible parts not bonded", "Trauma")),
+    (["alarm"],
+     ("Alarm failure", "Alarm not triggered or inaudible", "Delay of therapy")),
+    (["emc", "immunity", "emission", "esd", "radiated", "conducted"],
+     ("Electromagnetic interference", "Device behavior affected by EM field", "Incorrect Therapy")),
+    (["ip", "ingress", "water", "drip"],
+     ("Liquid ingress", "Moisture enters enclosure", "Incorrect Therapy")),
+    (["drop", "shock", "impact", "vibration"],
+     ("Mechanical shock/vibration", "Component/connection damage", "Trauma")),
+    (["battery", "power", "shutdown"],
+     ("Battery failure", "Unexpected shutdown", "Delay of therapy")),
+    (["usability", "human factors", "ui", "use error", "lockout"],
+     ("Use error", "User action leads to incorrect setup", "Incorrect Therapy")),
+    (["label", "marking", "symbol", "udi"],
+     ("Labeling error", "User misinterprets label/IFU", "Incorrect Therapy")),
+    (["luer", "connector", "80369"],
+     ("Misconnection", "Wrong small-bore connection", "Incorrect Therapy")),
+    (["temperature rise", "clause 11", "overheating"],
+     ("Overheating", "Accessible parts exceed safe temp", "Trauma")),
+]
 
-def _read_cache(key: str) -> Dict[str, Any] | None:
-    path = _cache_path(key)
+# ---------------------------
+# Utils
+# ---------------------------
+def _jsonl_load(path: str) -> List[Dict[str, Any]]:
     if not os.path.exists(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            obj = json.load(f)
-        # TTL
-        ts = obj.get("_ts", 0)
-        if time.time() - ts > MAUDE_TTL:
-            return None
-        return obj
-    except Exception:
-        return None
-
-def _write_cache(key: str, payload: Dict[str, Any]) -> None:
-    payload = dict(payload)
-    payload["_ts"] = int(time.time())
-    with open(_cache_path(key), "w", encoding="utf-8") as f:
-        json.dump(payload, f)
-
-def _fetch_maude_events(brand: str, limit: int) -> List[Dict[str, Any]]:
-    """Fetch MAUDE event records (FDA) for brand name."""
-    url = "https://api.fda.gov/device/event.json"
-    params = {"search": f'device.brand_name:"{brand}"', "limit": limit}
-    r = requests.get(url, params=params, timeout=25)
-    r.raise_for_status()
-    data = r.json()
-    return data.get("results", [])
-
-def _collect_maude_narratives(events: List[Dict[str, Any]]) -> List[str]:
+        return []
     out = []
-    for e in events or []:
-        # two possible fields:
-        tlist = e.get("mdr_text", []) or []
-        for t in tlist:
-            txt = t.get("text")
-            if txt and isinstance(txt, str):
-                # keep reasonably sized snippets
-                txt = re.sub(r"\s+", " ", txt).strip()
-                if 50 <= len(txt) <= 1200:
-                    out.append(txt)
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                continue
     return out
 
-
-# ----------------------
-# Tiny similarity & paraphrase
-# ----------------------
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip().lower()
-
-def _sim(a: str, b: str) -> float:
-    """Very small Jaccard-ish sim for de-dup control."""
-    A = set(_norm(a).split())
-    B = set(_norm(b).split())
-    if not A or not B:
-        return 0.0
-    return len(A & B) / float(len(A | B))
-
-def _paraphrase(text: str, max_words: int = 24) -> str:
-    """Cheap paraphrase using the model itself (short generation)."""
-    if not text:
+def _maybe_truncate_words(text: str, max_words: int) -> str:
+    words = text.split()
+    if len(words) <= max_words:
         return text
+    return " ".join(words[:max_words])
+
+def _paraphrase_sentence(text: str) -> str:
+    return re.sub(r"\b(device|system|pump)\b", "infusion system", text, flags=re.I)
+
+def _gc_cuda():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+def _log_once_banner():
+    global _logged_model_banner
+    if not _logged_model_banner:
+        print(f"[ha_infer] Using base={BASE_MODEL_ID}, adapter={HA_ADAPTER_REPO if USE_HA_ADAPTER else 'None'}, cache={CACHE_DIR}")
+        _logged_model_banner = True
+
+def _get_req_id(item: Any) -> str:
+    if isinstance(item, dict):
+        for k in ("Requirement ID", "requirement_id", "req_id", "RequirementID"):
+            v = item.get(k)
+            if v:
+                return str(v).strip()
+    return ""
+
+def _get_req_text(item: Any) -> str:
+    if isinstance(item, dict):
+        for k in ("Requirements", "requirements", "requirement", "Requirement"):
+            v = item.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        # fallback: stringify the dict (but shorten)
+        return _maybe_truncate_words(json.dumps(item, ensure_ascii=False), 40)
+    # string input
+    return str(item).strip()
+
+# ---------------------------
+# Model loader
+# ---------------------------
+def _load_model():
+    global _tokenizer, _model
+    if _model is not None:
+        return _tokenizer, _model
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from peft import PeftModel
+
+    device = "cuda" if (torch.cuda.is_available() and not FORCE_CPU) else "cpu"
+    _tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID, cache_dir=CACHE_DIR)
+    _tokenizer.pad_token = _tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL_ID,
+        device_map="auto" if device == "cuda" else None,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        cache_dir=CACHE_DIR,
+        offload_folder=OFFLOAD_DIR,
+    )
+
+    if USE_HA_ADAPTER:
+        model = PeftModel.from_pretrained(model, HA_ADAPTER_REPO, cache_dir=CACHE_DIR)
+
+    _model = model
+    _log_once_banner()
+    return _tokenizer, _model
+
+# ---------------------------
+# RAG / MAUDE
+# ---------------------------
+def _load_rag_once():
+    global _RAG_DB
+    if not _RAG_DB:
+        _RAG_DB = _jsonl_load(HA_RAG_PATH)
+
+def _load_maude_once():
+    global _MAUDE_ROWS
+    if not _MAUDE_ROWS and os.path.exists(MAUDE_LOCAL_PATH):
+        _MAUDE_ROWS = _jsonl_load(MAUDE_LOCAL_PATH)
+
+def _pick_rag_seed() -> Optional[Dict[str, Any]]:
+    _load_rag_once()
+    if not _RAG_DB:
+        return None
+    return random.choice(_RAG_DB)
+
+def _maude_snippets(n: int = 3) -> List[str]:
+    _load_maude_once()
+    if not _MAUDE_ROWS:
+        return []
+    # very short snippets just to inject variety
+    texts: List[str] = []
+    for r in random.sample(_MAUDE_ROWS, min(n * 4, len(_MAUDE_ROWS))):
+        for key in ("event_description", "device_problem_text", "event_text", "text", "mdr_text"):
+            v = r.get(key)
+            if isinstance(v, str) and len(v.strip()) > 30:
+                texts.append(_maybe_truncate_words(v.strip(), 30))
+    random.shuffle(texts)
+    return texts[:n]
+
+# ---------------------------
+# Prompt + Generation
+# ---------------------------
+def _build_prompt(requirement_text: str, rag_seed: Optional[Dict[str, Any]]) -> str:
+    context = ""
+    if rag_seed:
+        seeds = []
+        for k in ("hazard", "hazardous_situation", "risk_to_health", "text"):
+            v = rag_seed.get(k)
+            if isinstance(v, str) and v.strip():
+                s = _paraphrase_sentence(v) if PARAPHRASE_FROM_RAG else v
+                seeds.append(s)
+        if seeds:
+            context = "\nContext: " + " | ".join(seeds[:3])
+
+    if not MAUDE_LOCAL_ONLY:
+        m = _maude_snippets(2)
+        if m:
+            context += "\nMAUDE Evidence: " + " | ".join(m)
+
+    return (
+        f"### Instruction:\n"
+        f"Generate a concise hazard analysis JSON for an infusion pump requirement.\n"
+        f"Requirement: {requirement_text}\n"
+        f"{context}\n\n"
+        f"### Response:\n"
+    )
+
+def _decode_json_from_text(text: str) -> Dict[str, Any]:
     try:
-        _load_model()
-        import torch
-        prompt = (
-            "Paraphrase the following in different wording but same meaning. "
-            "Keep under {} words.\n\nText: {}\n\nParaphrase:".format(max_words, text)
+        match = re.search(r"\{.*\}", text, re.S)
+        if match:
+            return json.loads(match.group(0))
+    except Exception:
+        pass
+    return {}
+
+def _generate_json(prompt: str) -> Dict[str, Any]:
+    tok, model = _load_model()
+    enc = tok(prompt, return_tensors="pt", truncation=True, max_length=HA_INPUT_MAX_TOKENS).to(model.device)
+    with torch.no_grad():
+        out = model.generate(
+            **enc,
+            max_new_tokens=HA_MAX_NEW_TOKENS,
+            do_sample=DO_SAMPLE,
+            top_p=TOP_P,
+            temperature=TEMPERATURE,
+            num_beams=NUM_BEAMS,
+            repetition_penalty=REPETITION_PENALTY,
+            pad_token_id=tok.eos_token_id,
         )
-        inputs = _tokenizer(prompt, return_tensors="pt").to("cuda" if torch.cuda.is_available() else "cpu")
-        with torch.no_grad():
-            out = _model.generate(
-                **inputs,
-                max_new_tokens=64,
-                temperature=0.7,
-                top_p=0.9,
-                do_sample=True,
-            )
-        dec = _tokenizer.decode(out[0], skip_special_tokens=True)
-        # Keep the last line as the paraphrase
-        lines = [ln.strip() for ln in dec.split("\n") if ln.strip()]
-        para = lines[-1]
-        # trim to ~max_words
-        words = para.split()
-        if len(words) > max_words:
-            para = " ".join(words[:max_words])
-        return para
-    except Exception as e:
-        print({"paraphrase_warning": str(e)})
-        return text
+    decoded = tok.decode(out[0], skip_special_tokens=True)
+    if DEBUG_HA:
+        print("[DEBUG decoded]", decoded[:DEBUG_PEEK_CHARS])
+    return _decode_json_from_text(decoded)
 
+# ---------------------------
+# Mapping helpers
+# ---------------------------
+def choose_harm(risk_to_health: str) -> str:
+    harms = HARM_BY_RTH.get(risk_to_health, [])
+    if harms:
+        return random.choice(harms)
+    return "Severe Injury"
 
-# ----------------------
-# Core HA row synthesis
-# ----------------------
-def _risks_for_requirement(req_text: str) -> List[str]:
-    # fixed palette like before
-    palette = [
-        "Air Embolism", "Allergic response", "Infection", "Overdose",
-        "Underdose", "Delay of therapy", "Environmental Hazard",
-        "Incorrect Therapy", "Trauma", "Particulate",
-    ]
-    # simple select 1–2 based on hash
-    h = int(hashlib.md5(_norm(req_text).encode("utf-8")).hexdigest(), 16)
-    idx = h % len(palette)
-    idx2 = (idx + 3) % len(palette)
-    return [palette[idx], palette[idx2]]
+def suggest_control(hazard: str, requirement_text: str) -> str:
+    hz = hazard.lower()
+    rt = requirement_text.lower()
+    if "flow" in rt or "accuracy" in rt:
+        return "Flow calibration; verification per IEC 60601-2-24"
+    if "air" in rt:
+        return "Ultrasonic air-in-line detector with alarm; purge guidance"
+    if "occlusion" in rt or "blockage" in rt:
+        return "Pressure sensing with occlusion alarm; tubing management"
+    if "leakage current" in rt:
+        return "Leakage current limits; type testing per IEC 60601-1"
+    if "dielectric" in rt or "hipot" in rt:
+        return "Dielectric withstand test; insulation design margins"
+    if "insulation" in rt:
+        return "Creepage/clearance compliance; insulation resistance checks"
+    if "protective earth" in rt:
+        return "Bonding resistance test; protective earth integrity"
+    if "alarm" in rt:
+        return "Alarm verification per IEC 60601-1-8; audibility tests"
+    if "emc" in rt or "immunity" in rt or "esd" in rt:
+        return "EMC testing (IEC 60601-1-2); functional performance criteria"
+    if "ingress" in rt or "ip" in rt or "drip" in rt:
+        return "IP testing per IEC 60529; gasket and seam protection"
+    if "vibration" in rt or "shock" in rt or "drop" in rt or "impact" in rt:
+        return "Mechanical robustness tests; secure connectors"
+    if "battery" in rt or "power" in rt:
+        return "Battery monitoring; backup and safe-shutdown behavior"
+    if "label" in rt or "marking" in rt or "udi" in rt:
+        return "Label content verification; IFU validation and symbols per ISO 15223-1"
+    if "luer" in rt or "connector" in rt or "80369" in rt:
+        return "ISO 80369-7 compliance; misconnection prevention"
+    if "temperature" in rt or "overheating" in rt:
+        return "Temperature rise tests (clause 11); thermal protection"
+    # generic but still meaningful
+    if "electrical" in hz:
+        return "Insulation barriers and protective earthing; type testing"
+    return "Risk controls via design/alarms/labeling; verification per relevant standards"
 
-def _row_from_sources(req_id: str, risk: str, narratives: List[str]) -> Dict[str, str]:
-    """
-    Compress multiple narratives into structured HA fields with short phrasing.
-    """
-    # defaults
-    hazard = "Device malfunction"
-    situation = "Patient exposed to device fault"
-    harm = "Adverse physiological effects"
-    soe = "Improper setup or device issue led to patient exposure"
+def _ensure_fields(obj: Dict[str, Any], requirement_text: str, idx: int) -> Dict[str, Any]:
+    risk_id = f"HA-{idx+1:03d}"
 
-    # If we have narratives, extract a few hints
-    blob = " ".join(narratives[:3])  # limit to 3 chunks per risk
-    blob_n = _norm(blob)
+    # heuristic mapping from requirement text
+    matched = None
+    lt = requirement_text.lower()
+    for keys, (haz, sit, rth) in REQ_TO_HA_PATTERNS:
+        if any(k in lt for k in keys):
+            matched = (haz, sit, rth)
+            break
 
-    # hazard-ish
-    if "air" in blob_n and "line" in blob_n:
-        hazard = "Air in Line"
-        situation = "Patient exposed to intravenous air"
-        harm = "Shortness of breath, Cardiac Arrhythmia"
-        soe = "Set not primed before attached to pump & patient"
-    elif "occlusion" in blob_n or "block" in blob_n:
-        hazard = "Occlusion"
-        situation = "Flow interrupted due to downstream blockage"
-        harm = "Delay of therapy, Pain at insertion site"
-        soe = "Tubing occluded; pressure rise during infusion"
-    elif "leak" in blob_n:
-        hazard = "Leakage"
-        situation = "Fluid leakage around line/connector"
-        harm = "Exposure to infusion fluid; Loss of intended therapy"
-        soe = "Loose connector led to gradual leak during use"
+    hazard = matched[0] if matched else obj.get("hazard", "Device malfunction")
+    situation = matched[1] if matched else obj.get("hazardous_situation", "Patient exposed to device fault")
+    risk_to_health = matched[2] if matched else obj.get("risk_to_health", random.choice(RISK_TO_HEALTH_CHOICES))
 
-    # guard + paraphrase-lite to avoid copy-paste
-    if PARA_ENABLE:
-        hazard = _paraphrase(hazard, 8) if hazard else hazard
-        situation = _paraphrase(situation, 16) if situation else situation
-        harm = _paraphrase(harm, 16) if harm else harm
-        soe = _paraphrase(soe, 18) if soe else soe
+    # introduce mild diversity even when model returns same blob
+    if not matched:
+        if "flow" in lt:
+            hazard, situation, risk_to_health = "Inaccurate flow rate", "Incorrect volume delivered", "Incorrect Therapy"
+        elif "air" in lt:
+            hazard, situation, risk_to_health = "Air-in-line not detected", "Patient receives air", "Air Embolism"
+        elif "occlusion" in lt:
+            hazard, situation, risk_to_health = "Line occlusion", "Flow restricted during therapy", "Delay of therapy"
+
+    harm = choose_harm(risk_to_health)
+
+    seq = obj.get("sequence_of_events")
+    if not isinstance(seq, str) or not seq.strip():
+        seq = "Design or use issue leads to hazardous condition"
+
+    # severity normalization
+    sev_raw = obj.get("severity", obj.get("severity_of_harm", "3"))
+    try:
+        sev = int(str(sev_raw))
+        if sev < 1 or sev > 5:
+            sev = 3
+    except Exception:
+        sev = 3
+
+    control = suggest_control(hazard, requirement_text)
 
     return {
-        "risk_to_health": risk,
+        "risk_id": risk_id,
+        "risk_to_health": risk_to_health,
         "hazard": hazard,
         "hazardous_situation": situation,
         "harm": harm,
-        "sequence_of_events": soe,
+        "sequence_of_events": seq,
+        "severity_of_harm": str(sev),
+        "p0": "Medium",
+        "p1": "Medium",
+        "poh": "Low",
+        "risk_index": "Medium" if sev <= 3 else "High",
+        "risk_control": control,
     }
 
+# ---------------------------
+# Public
+# ---------------------------
+def infer_from_requirement(item: Any, idx: int) -> Dict[str, Any]:
+    req_text = _get_req_text(item)
+    rag_seed = _pick_rag_seed()
+    prompt = _build_prompt(req_text, rag_seed)
+    raw = _generate_json(prompt)
+    data = _ensure_fields(raw, req_text, idx)
 
-# ----------------------
-# Public API
-# ----------------------
-def infer_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    _load_model()
-    _load_rag()
+    rid = _get_req_id(item)
+    if rid:
+        data["requirement_id"] = rid
+    return data
 
-    # QUICK limit (defensive)
-    if QUICK_LIMIT and len(requirements) > QUICK_LIMIT:
-        requirements = requirements[:QUICK_LIMIT]
-
-    # 1) RAG small helper (closest hazard template by simple token overlap)
-    def _rag_hint(risk: str) -> Dict[str, str] | None:
-        best, best_s = None, 0.0
-        for row in _RAG_DB or []:
-            cand = str(row.get("Risk to Health") or row.get("risk_to_health") or "")
-            s = _sim(cand, risk)
-            if s > best_s:
-                best_s = s
-                best = row
-        if best and best_s >= SIM_THRESHOLD:
-            out = {
-                "risk_to_health": risk,
-                "hazard": best.get("Hazard") or "",
-                "hazardous_situation": best.get("Hazardous situation") or "",
-                "harm": best.get("Harm") or "",
-                "sequence_of_events": best.get("Sequence of Events") or "",
-            }
-            # paraphrase to avoid verbatim
-            if PARA_ENABLE:
-                for k in ("hazard", "hazardous_situation", "harm", "sequence_of_events"):
-                    out[k] = _paraphrase(out[k], 18)
-            return out
-        return None
-
-    # 2) MAUDE fetch (single brand, randomized 70%)
-    maude_brand = MAUDE_DEVICE.split(",")[0].strip() if MAUDE_DEVICE else "SIGMA SPECTRUM"
-    use_maude = MAUDE_FETCH
-
-    maude_events: List[Dict[str, Any]] = []
-    maude_narratives: List[str] = []
-
-    if use_maude:
-        cache_key = f"maude::{maude_brand}::{MAUDE_LIMIT}"
-        cached = _read_cache(cache_key)
-        if cached:
-            maude_events = cached.get("events", [])
-            maude_narratives = cached.get("narratives", [])
-        else:
-            try:
-                ev = _fetch_maude_events(maude_brand, MAUDE_LIMIT)
-                maude_events = ev
-                maude_narratives = _collect_maude_narratives(ev)
-                _write_cache(cache_key, {"events": ev, "narratives": maude_narratives})
-            except Exception as e:
-                print({"maude_fetch_warning": str(e)})
-                maude_events = []
-                maude_narratives = []
-
-        print({
-            "maude_devices": [maude_brand],
-            "maude_counts": {maude_brand: len(maude_events)},
-            "maude_total": len(maude_events)
-        })
-        print({"maude_events_total": len(maude_events), "maude_narratives": len(maude_narratives)})
-
-    rows: List[Dict[str, Any]] = []
-
-    for r in requirements or []:
-        rid = str(r.get("Requirement ID") or r.get("requirement_id") or "")
-        rtxt = str(r.get("Requirements") or r.get("requirements") or "")
-        risk_ids = _risks_for_requirement(rtxt)
-
-        for risk in risk_ids:
-            # Decide per-row if we use MAUDE based on rate (70%)
-            use_row_maude = use_maude and (random.random() < MAUDE_SAMPLE_RATE) and bool(maude_narratives)
-
-            if use_row_maude:
-                # use narrative-backed
-                srow = _row_from_sources(rid, risk, maude_narratives)
-            else:
-                # try RAG hint; if none, make short generic + paraphrase
-                hint = _rag_hint(risk)
-                if hint:
-                    srow = hint
-                else:
-                    srow = _row_from_sources(rid, risk, [])
-
-            row = {
-                "requirement_id": rid or "REQ-000",
-                "risk_id": f"HA-{random.randint(1000,9999)}",
-                "risk_to_health": srow.get("risk_to_health", risk),
-                "hazard": srow.get("hazard", "Device malfunction"),
-                "hazardous_situation": srow.get("hazardous_situation", "Patient exposed to device fault"),
-                "harm": srow.get("harm", "Adverse physiological effects"),
-                "sequence_of_events": srow.get("sequence_of_events", "Device issue led to patient exposure"),
-                # keep same severity table / p0/p1/poh
+def infer_ha(requirements: List[Any]) -> List[Dict[str, Any]]:
+    results = []
+    for idx, item in enumerate((requirements or [])[:ROW_LIMIT]):
+        try:
+            results.append(infer_from_requirement(item, idx))
+        except Exception as e:
+            if DEBUG_HA:
+                print(f"[ha] row {idx} error: {e}")
+            # Still produce a row so downstream never breaks
+            req_text = _get_req_text(item)
+            fallback = {
+                "risk_id": f"HA-{idx+1:03d}",
+                "risk_to_health": random.choice(RISK_TO_HEALTH_CHOICES),
+                "hazard": "Device malfunction",
+                "hazardous_situation": "Patient exposed to device fault",
+                "harm": "Severe Injury",
+                "sequence_of_events": "Design or use issue leads to hazardous condition",
                 "severity_of_harm": "3",
                 "p0": "Medium",
                 "p1": "Medium",
                 "poh": "Low",
                 "risk_index": "Medium",
-                "risk_control": "The pump must maintain flow precision kept within ±5%.",
+                "risk_control": suggest_control("Device malfunction", req_text),
             }
-
-            # micro-clean: avoid "string" placeholders
-            for k in ("hazard", "hazardous_situation", "harm", "sequence_of_events"):
-                if not row[k] or row[k].strip().lower() in {"string", "tbd"}:
-                    row[k] = "TBD"
-
-            rows.append(row)
-
-        # stop if QUICK_LIMIT would be exceeded by many risks
-        if QUICK_LIMIT and len(rows) >= QUICK_LIMIT:
-            rows = rows[:QUICK_LIMIT]
-            break
-
-    return rows
+            rid = _get_req_id(item)
+            if rid:
+                fallback["requirement_id"] = rid
+            results.append(fallback)
+    _gc_cuda()
+    return results
