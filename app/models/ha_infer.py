@@ -338,6 +338,120 @@ def suggest_control(hazard: str, requirement_text: str) -> str:
         return "Insulation barriers and protective earthing; type testing"
     return "Risk controls via design/alarms/labeling; verification per relevant standards"
 
+RISK_WORD_TO_LEVEL = {"Very Low": 1, "Low": 2, "Medium": 3, "High": 4, "Very High": 5}
+LEVEL_TO_RISK_WORD = {v: k for k, v in RISK_WORD_TO_LEVEL.items()}
+
+def _seq_templates(hazard: str, rth: str) -> list[str]:
+    hz = hazard.lower()
+    if "air-in-line" in hz or "air in line" in hz or "air" in hz:
+        return [
+            "Air enters set → detector fails/late → patient receives air",
+            "Bubble bypasses sensor → venous access → embolic event",
+            "Residual air after setup → inadequate purge → embolism risk",
+        ]
+    if "occlusion" in hz or "blockage" in hz:
+        return [
+            "Upstream blockage → pump continues/alarms late → restricted delivery",
+            "Kinked tubing → pressure rises → therapy interrupted",
+            "Downstream clamp left closed → occlusion develops → delivery stops",
+        ]
+    if "flow" in hz or "inaccurate" in hz:
+        return [
+            "Calibration drift → setpoint not met → incorrect volume delivered",
+            "Misassembled set → flow error → under/over delivery",
+            "Viscosity/height change → un-compensated → rate deviates",
+        ]
+    if "emc" in hz or "interference" in hz or "esd" in hz:
+        return [
+            "EM field couples into electronics → control loop perturbed → wrong output",
+            "ESD hit → transient upset → alarm/therapy error",
+            "Radiated immunity failure → spurious inputs → incorrect therapy",
+        ]
+    if "leakage" in hz or "earth" in hz or "insulation" in hz or "dielectric" in hz:
+        return [
+            "Insulation degradation → leakage path forms → patient contact current",
+            "Protective earth open → fault current through patient",
+            "Dielectric breakdown → exposed conductive part energized",
+        ]
+    if "ingress" in hz or "liquid" in hz or "ip" in hz:
+        return [
+            "Liquid drip enters enclosure → short/erratic behavior → wrong output",
+            "Condensation in device → sensor error → incorrect therapy",
+        ]
+    if "label" in hz or "use error" in hz:
+        return [
+            "Ambiguous label/IFU → user sets wrong value → incorrect therapy",
+            "Similar connector/marking → misconnection → wrong route/dose",
+        ]
+    if "shock" in hz or "impact" in hz or "vibration" in hz or "drop" in hz:
+        return [
+            "Mechanical shock → component shifts → intermittent failure",
+            "Vibration loosens fitting → leak → therapy interruption",
+        ]
+    # generic set
+    return [
+        "Design or use issue evolves → hazardous device state → patient impact",
+        "Fault undetected → device behavior drifts → hazardous situation",
+        "Abnormal condition persists → unsafe output → clinical harm",
+    ]
+
+
+def _derive_severity_pxx(rth: str, hazard: str) -> tuple[str, str, str, str]:
+    """
+    Returns (severity_of_harm, p0, p1, poh).
+    Severity is '1'..'5'; p0/p1/poh ∈ {Very Low, Low, Medium, High, Very High}.
+    """
+    # severity priors by Risk to Health
+    sev_map = {
+        "Air Embolism": (4, 5),
+        "Overdose": (3, 5),
+        "Incorrect Therapy": (2, 4),
+        "Underdose": (2, 4),
+        "Infection": (3, 4),
+        "Trauma": (2, 4),
+        "Particulate": (2, 4),
+        "Delay of therapy": (2, 4),
+        "Environmental Hazard": (2, 3),
+        "Allergic response": (2, 3),
+    }
+    lo, hi = sev_map.get(rth, (2, 4))
+    severity = str(random.randint(lo, hi))
+
+    # p0 by hazard “type”
+    hz = hazard.lower()
+    if any(k in hz for k in ["air-in-line", "air ", "embol"]):
+        p0 = "High"
+    elif any(k in hz for k in ["occlusion", "blockage"]):
+        p0 = "Medium"
+    elif any(k in hz for k in ["flow", "inaccurate", "label", "use error", "emc", "interference"]):
+        p0 = "Medium"
+    elif any(k in hz for k in ["leakage", "earth", "insulation", "dielectric"]):
+        p0 = "Low"
+    else:
+        p0 = random.choice(["Low", "Medium"])
+
+    # Controls reduce p1 and poh by ~1 level (bounded to 1..5)
+    def down1(word: str) -> str:
+        lvl = max(1, RISK_WORD_TO_LEVEL[word] - 1)
+        return LEVEL_TO_RISK_WORD[lvl]
+
+    p1 = down1(p0)
+    poh = down1(p1)
+
+    return severity, p0, p1, poh
+
+
+def _risk_index_from(severity: str, p0: str) -> str:
+    # simple matrix on sev (1..5) × likelihood (1..5)
+    s = max(1, min(5, int(severity) if severity.isdigit() else 3))
+    l = RISK_WORD_TO_LEVEL.get(p0, 3)
+    score = s * l  # 1..25
+    if score >= 16:
+        return "High"
+    if score >= 9:
+        return "Medium"
+    return "Low"
+
 def _ensure_fields(obj: Dict[str, Any], requirement_text: str, idx: int) -> Dict[str, Any]:
     risk_id = f"HA-{idx+1:03d}"
 
@@ -353,31 +467,42 @@ def _ensure_fields(obj: Dict[str, Any], requirement_text: str, idx: int) -> Dict
     situation = matched[1] if matched else obj.get("hazardous_situation", "Patient exposed to device fault")
     risk_to_health = matched[2] if matched else obj.get("risk_to_health", random.choice(RISK_TO_HEALTH_CHOICES))
 
-    # introduce mild diversity even when model returns same blob
+    # extra diversity by requirement keywords when no direct pattern matched
     if not matched:
         if "flow" in lt:
             hazard, situation, risk_to_health = "Inaccurate flow rate", "Incorrect volume delivered", "Incorrect Therapy"
         elif "air" in lt:
             hazard, situation, risk_to_health = "Air-in-line not detected", "Patient receives air", "Air Embolism"
-        elif "occlusion" in lt:
+        elif "occlusion" in lt or "blockage" in lt:
             hazard, situation, risk_to_health = "Line occlusion", "Flow restricted during therapy", "Delay of therapy"
 
+    # sequence of events: pick varied templates and shuffle wording lightly
+    seq_options = _seq_templates(hazard, risk_to_health)
+    sequence = random.choice(seq_options)
+    sequence = sequence.replace(" → ", " \u2192 ")  # nice arrow
+    if random.random() < 0.35:
+        sequence = sequence.capitalize()
+
+    # severity & likelihoods (p0, p1, poh) + derived risk index
+    severity, p0, p1, poh = _derive_severity_pxx(risk_to_health, hazard)
+    risk_index = _risk_index_from(severity, p0)
+
+    # harm consistent with Risk to Health
     harm = choose_harm(risk_to_health)
 
-    seq = obj.get("sequence_of_events")
-    if not isinstance(seq, str) or not seq.strip():
-        seq = "Design or use issue leads to hazardous condition"
+    # allow model JSON to override if it provided reasonable fields
+    seq_in = obj.get("sequence_of_events")
+    if isinstance(seq_in, str) and len(seq_in.strip()) > 8:
+        sequence = seq_in.strip()
 
-    # severity normalization
-    sev_raw = obj.get("severity", obj.get("severity_of_harm", "3"))
+    sev_in = obj.get("severity") or obj.get("severity_of_harm")
     try:
-        sev = int(str(sev_raw))
-        if sev < 1 or sev > 5:
-            sev = 3
+        sev_val = int(str(sev_in))
+        if 1 <= sev_val <= 5:
+            severity = str(sev_val)
+            risk_index = _risk_index_from(severity, p0)
     except Exception:
-        sev = 3
-
-    control = suggest_control(hazard, requirement_text)
+        pass
 
     return {
         "risk_id": risk_id,
@@ -385,14 +510,15 @@ def _ensure_fields(obj: Dict[str, Any], requirement_text: str, idx: int) -> Dict
         "hazard": hazard,
         "hazardous_situation": situation,
         "harm": harm,
-        "sequence_of_events": seq,
-        "severity_of_harm": str(sev),
-        "p0": "Medium",
-        "p1": "Medium",
-        "poh": "Low",
-        "risk_index": "Medium" if sev <= 3 else "High",
-        "risk_control": control,
+        "sequence_of_events": sequence,
+        "severity_of_harm": severity,
+        "p0": p0,
+        "p1": p1,
+        "poh": poh,
+        "risk_index": risk_index,
+        "risk_control": suggest_control(hazard, requirement_text),
     }
+
 
 # ---------------------------
 # Public
